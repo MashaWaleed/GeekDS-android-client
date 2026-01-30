@@ -793,6 +793,10 @@ class MainActivity : Activity() {
                     val playlistChanged = json.optBoolean("playlist_changed", false)
                     val activePlaylistId = json.optInt("active_playlist_id", -1)
 
+                    if (scheduleChanged || playlistChanged) {
+                        Log.i("GeekDS", "🔔 Changes detected - schedule: $scheduleChanged, playlist: $playlistChanged, activePlaylistId: $activePlaylistId")
+                    }
+
                     // Update device name if server sends it back
                     val serverDeviceName = json.optString("name", null)
                     if (serverDeviceName != null && serverDeviceName.isNotEmpty() && serverDeviceName != deviceName) {
@@ -838,10 +842,17 @@ class MainActivity : Activity() {
 
                     // Detect implicit schedule clear (server returns version 0) even if schedule_changed false
                     val implicitScheduleCleared = (lastKnownScheduleVersion == 0L && scheduleChanged.not() && currentPlaylistId == null)
+
+                    // Handle schedule changes
                     if (scheduleChanged || implicitScheduleCleared) {
                         // Only fetch schedule if server thinks something changed OR we saw a clear
                         fetchDeviceSchedule()
-                    } else if (playlistChanged && currentPlaylistId != null) {
+                    }
+
+                    // Handle playlist content changes (independent of schedule changes)
+                    // CRITICAL: This must run even if scheduleChanged is true!
+                    if (playlistChanged && currentPlaylistId != null) {
+                        Log.i("GeekDS", "🔄 Playlist content changed for playlist $currentPlaylistId - reloading")
                         fetchPlaylist(currentPlaylistId!!)
                     }
                 } catch (e: Exception) {
@@ -995,7 +1006,7 @@ class MainActivity : Activity() {
 
                     val playlist = Playlist(id = playlistId, mediaFiles = mediaFiles)
                     savePlaylistById(this@MainActivity, playlistId, playlist)
-                    Log.i("GeekDS", "Cached playlist $playlistId with ${mediaFiles.size} files")
+                    Log.i("GeekDS", "📋 Cached playlist $playlistId with ${mediaFiles.size} files: ${mediaFiles.map { it.filename }}")
 
                     // Start downloading media files in background for offline use
                     mediaFiles.forEach { mediaFile ->
@@ -1779,6 +1790,12 @@ class MainActivity : Activity() {
 
                 val playlist = Playlist(id = playlistId, mediaFiles = mediaFiles)
 
+                // Log playlist content for debugging
+                Log.i("GeekDS", "📋 Playlist $playlistId content: ${mediaFiles.size} files")
+                mediaFiles.forEachIndexed { index, file ->
+                    Log.i("GeekDS", "  [$index] ${file.filename} (${file.duration}s, ${file.type})")
+                }
+
                 // Check if playlist content actually changed by comparing with saved playlist
                 val savedPlaylist = loadPlaylist(this@MainActivity)
                 val contentChanged = savedPlaylist == null ||
@@ -1786,6 +1803,16 @@ class MainActivity : Activity() {
                         savedPlaylist.mediaFiles.zip(playlist.mediaFiles).any { (old, new) ->
                             old.filename != new.filename
                         }
+
+                if (contentChanged) {
+                    Log.i("GeekDS", "🔄 Playlist content CHANGED!")
+                    if (savedPlaylist != null) {
+                        Log.i("GeekDS", "  Old: ${savedPlaylist.mediaFiles.map { it.filename }}")
+                        Log.i("GeekDS", "  New: ${mediaFiles.map { it.filename }}")
+                    }
+                } else {
+                    Log.i("GeekDS", "✓ Playlist content unchanged")
+                }
 
                 savePlaylist(this@MainActivity, playlist)
 
@@ -2229,6 +2256,15 @@ class MainActivity : Activity() {
         // DEBUG: Log all schedules
         schedules.forEachIndexed { index, sched ->
             Log.d("GeekDS", "Schedule[$index]: '${sched.name}' playlist=${sched.playlistId}")
+
+            // Load and display playlist content
+            val playlistContent = loadPlaylistById(this, sched.playlistId)
+            if (playlistContent != null && playlistContent.mediaFiles.isNotEmpty()) {
+                Log.d("GeekDS", "  Playlist content: ${playlistContent.mediaFiles.map { it.filename }.joinToString(", ")}")
+            } else {
+                Log.d("GeekDS", "  Playlist content: (not cached or empty)")
+            }
+
             Log.d("GeekDS", "  Days: ${sched.daysOfWeek.joinToString(",")}")
             Log.d("GeekDS", "  Time: ${sched.timeSlotStart}-${sched.timeSlotEnd}")
             Log.d("GeekDS", "  Valid: ${sched.validFrom} to ${sched.validUntil}")

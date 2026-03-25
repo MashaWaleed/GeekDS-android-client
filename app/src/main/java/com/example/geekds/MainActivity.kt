@@ -63,7 +63,7 @@ import androidx.core.content.FileProvider
 
 class MainActivity : Activity() {
     private var deviceName: String = "ARC-A-GR-18" // Default fallback
-    private var cmsUrl: String = "http://192.168.1.6:5000" // Default fallback
+    private var cmsUrl: String = "http://192.168.1.11:5000" // Default fallback
     private var deviceId: Int? = null
     private var deviceUuid: String? = null
     private var appVersion: String = "unknown" // App version from build.gradle
@@ -732,9 +732,12 @@ class MainActivity : Activity() {
                 if (currentMediaItem != null) {
                     val mediaUri = currentMediaItem.localConfiguration?.uri
                     if (mediaUri != null) {
-                        val mediaFilename = mediaUri.path?.substringAfterLast('/') ?: ""
-                        if (mediaFilename.isNotEmpty()) {
-                            put("current_media", mediaFilename)
+                        val storageFilename = mediaUri.path?.substringAfterLast('/') ?: ""
+                        if (storageFilename.isNotEmpty()) {
+                            // Strip the ID prefix (format: "7-sara-1.mp4" -> "sara-1.mp4")
+                            // Files are stored as {id}-{originalFilename}, server expects originalFilename
+                            val originalFilename = storageFilename.replaceFirst(Regex("^\\d+-"), "")
+                            put("current_media", originalFilename)
                             put("current_position_ms", currentPlayer.currentPosition)
                         }
                     }
@@ -984,6 +987,7 @@ class MainActivity : Activity() {
                             val media = mediaDetailsJson.getJSONObject(i)
                             mediaFiles.add(
                                 MediaFile(
+                                    id = media.getInt("id"),
                                     filename = media.getString("filename"),
                                     duration = media.optInt("duration", 0),
                                     type = media.optString("type", "video/mp4")
@@ -991,11 +995,14 @@ class MainActivity : Activity() {
                             )
                         }
                     } else {
+                        // Fallback - if media_details not available, media_files won't have IDs
+                        // This should not happen with current backend, but handle gracefully
                         val mediaFilesJson = obj.getJSONArray("media_files")
                         for (i in 0 until mediaFilesJson.length()) {
                             val media = mediaFilesJson.getJSONObject(i)
                             mediaFiles.add(
                                 MediaFile(
+                                    id = media.optInt("id", 0), // Fallback to 0 if not present
                                     filename = media.getString("filename"),
                                     duration = media.optInt("duration", 0),
                                     type = media.optString("type", "video/mp4")
@@ -1006,15 +1013,15 @@ class MainActivity : Activity() {
 
                     val playlist = Playlist(id = playlistId, mediaFiles = mediaFiles)
                     savePlaylistById(this@MainActivity, playlistId, playlist)
-                    Log.i("GeekDS", "📋 Cached playlist $playlistId with ${mediaFiles.size} files: ${mediaFiles.map { it.filename }}")
+                    Log.i("GeekDS", "📋 Cached playlist $playlistId with ${mediaFiles.size} files: ${mediaFiles.map { "${it.id}-${it.filename}" }}")
 
                     // Start downloading media files in background for offline use
                     mediaFiles.forEach { mediaFile ->
-                        val file = File(getExternalFilesDir(null), mediaFile.filename)
+                        val file = File(getExternalFilesDir(null), mediaFile.getStorageFilename())
                         if (!file.exists() || file.length() == 0L) {
-                            downloadMediaWithCallback(mediaFile.filename) { success ->
+                            downloadMediaWithCallback(mediaFile.getStorageFilename(), mediaFile.filename) { success ->
                                 if (success) {
-                                    Log.i("GeekDS", "Pre-downloaded media: ${mediaFile.filename}")
+                                    Log.i("GeekDS", "Pre-downloaded media: ${mediaFile.getStorageFilename()}")
                                 }
                             }
                         }
@@ -1767,6 +1774,7 @@ class MainActivity : Activity() {
                         val media = mediaDetailsJson.getJSONObject(i)
                         mediaFiles.add(
                             MediaFile(
+                                id = media.getInt("id"),
                                 filename = media.getString("filename"),
                                 duration = media.optInt("duration", 0),
                                 type = media.optString("type", "video/mp4")
@@ -1780,6 +1788,7 @@ class MainActivity : Activity() {
                         val media = mediaFilesJson.getJSONObject(i)
                         mediaFiles.add(
                             MediaFile(
+                                id = media.optInt("id", 0),
                                 filename = media.getString("filename"),
                                 duration = media.optInt("duration", 0),
                                 type = media.optString("type", "video/mp4")
@@ -1853,8 +1862,9 @@ class MainActivity : Activity() {
         }, 120_000L)
 
         // Track which files we're downloading vs already have
+        // Use getStorageFilename() which includes media ID for uniqueness
         val filesToDownload = playlist.mediaFiles.filter { mediaFile ->
-            val file = File(getExternalFilesDir(null), mediaFile.filename)
+            val file = File(getExternalFilesDir(null), mediaFile.getStorageFilename())
             !file.exists() || file.length() == 0L
         }
 
@@ -1870,12 +1880,12 @@ class MainActivity : Activity() {
         Log.i("GeekDS", "Need to download ${filesToDownload.size} files")
 
         filesToDownload.forEach { mediaFile ->
-            downloadMediaWithCallback(mediaFile.filename) { success ->
+            downloadMediaWithCallback(mediaFile.getStorageFilename(), mediaFile.filename) { success ->
                 downloadCount++
                 if (success) {
-                    Log.i("GeekDS", "Downloaded: ${mediaFile.filename}")
+                    Log.i("GeekDS", "Downloaded: ${mediaFile.getStorageFilename()}")
                 } else {
-                    Log.e("GeekDS", "Failed to download: ${mediaFile.filename}")
+                    Log.e("GeekDS", "Failed to download: ${mediaFile.getStorageFilename()}")
                 }
 
                 if (downloadCount == filesToDownload.size) {
@@ -1902,26 +1912,28 @@ class MainActivity : Activity() {
     }
 
     // Updated download function with callback and proper file completion detection
-    private fun downloadMediaWithCallback(filename: String, callback: (Boolean) -> Unit) {
-        val file = File(getExternalFilesDir(null), filename)
+    // storageFilename: unique filename for local storage (e.g., "123-video.mp4")
+    // originalFilename: server filename to fetch (e.g., "video.mp4")
+    private fun downloadMediaWithCallback(storageFilename: String, originalFilename: String, callback: (Boolean) -> Unit) {
+        val file = File(getExternalFilesDir(null), storageFilename)
         if (file.exists() && file.length() > 0) {
-            Log.i("GeekDS", "File already exists: $filename (${file.length()} bytes)")
+            Log.i("GeekDS", "File already exists: $storageFilename (${file.length()} bytes)")
             callback(true) // Already exists and has content
             return
         }
 
         // Check if download already in progress for this file
-        if (!activeDownloads.add(filename)) {
-            Log.w("GeekDS", "Download already in progress for: $filename - skipping duplicate request")
+        if (!activeDownloads.add(storageFilename)) {
+            Log.w("GeekDS", "Download already in progress for: $storageFilename - skipping duplicate request")
             callback(false)
             return
         }
 
-        Log.i("GeekDS", "Starting download: $filename")
+        Log.i("GeekDS", "Starting download: $storageFilename (from server: $originalFilename)")
 
-        // URL encode the filename to handle spaces and special characters
-        val encodedFilename = java.net.URLEncoder.encode(filename, "UTF-8").replace("+", "%20")
-        Log.d("GeekDS", "Encoded filename: $encodedFilename")
+        // URL encode the ORIGINAL filename to fetch from server
+        val encodedFilename = java.net.URLEncoder.encode(originalFilename, "UTF-8").replace("+", "%20")
+        Log.d("GeekDS", "Encoded server filename: $encodedFilename")
 
         val req = Request.Builder()
             .url("$cmsUrl/api/media/$encodedFilename")
@@ -1929,29 +1941,29 @@ class MainActivity : Activity() {
             .build()
         client.newCall(req).enqueue(object : Callback {
             override fun onFailure(call: Call, e: IOException) {
-                activeDownloads.remove(filename)
-                Log.e("GeekDS", "Download failed: $filename $e")
+                activeDownloads.remove(storageFilename)
+                Log.e("GeekDS", "Download failed: $storageFilename $e")
                 callback(false)
             }
 
             override fun onResponse(call: Call, response: Response) {
                 if (!response.isSuccessful) {
-                    activeDownloads.remove(filename)
-                    Log.e("GeekDS", "Download failed: $filename ${response.code}")
+                    activeDownloads.remove(storageFilename)
+                    Log.e("GeekDS", "Download failed: $storageFilename ${response.code}")
                     callback(false)
                     return
                 }
                 try {
                     val responseBody = response.body
                     if (responseBody == null) {
-                        activeDownloads.remove(filename)
-                        Log.e("GeekDS", "Download failed: $filename - no response body")
+                        activeDownloads.remove(storageFilename)
+                        Log.e("GeekDS", "Download failed: $storageFilename - no response body")
                         callback(false)
                         return
                     }
 
                     // Write to a temporary file first
-                    val tempFile = File(file.parent, "${filename}.tmp")
+                    val tempFile = File(file.parent, "${storageFilename}.tmp")
                     val sink = FileOutputStream(tempFile)
 
                     val inputStream = responseBody.byteStream()
@@ -1973,10 +1985,10 @@ class MainActivity : Activity() {
                     if (tempFile.exists() && tempFile.length() > 0) {
                         // Move temp file to final location
                         val renameSuccess = tempFile.renameTo(file)
-                        Log.d("GeekDS", "Rename result for $filename: $renameSuccess (temp=${tempFile.absolutePath}, final=${file.absolutePath})")
+                        Log.d("GeekDS", "Rename result for $storageFilename: $renameSuccess (temp=${tempFile.absolutePath}, final=${file.absolutePath})")
 
                         if (renameSuccess) {
-                            Log.i("GeekDS", "Download completed: $filename (${totalBytes} bytes)")
+                            Log.i("GeekDS", "Download completed: $storageFilename (${totalBytes} bytes)")
 
                             // Double-check the final file
                             val finalExists = file.exists()
@@ -1985,32 +1997,32 @@ class MainActivity : Activity() {
                             Log.d("GeekDS", "Verification: exists=$finalExists, size=$finalSize (expected=$totalBytes), readable=$finalReadable")
 
                             if (finalExists && finalSize == totalBytes && finalReadable) {
-                                activeDownloads.remove(filename)
+                                activeDownloads.remove(storageFilename)
                                 callback(true)
                             } else {
-                                activeDownloads.remove(filename)
-                                Log.e("GeekDS", "Download verification failed: $filename - exists=$finalExists, size=$finalSize vs $totalBytes, readable=$finalReadable")
+                                activeDownloads.remove(storageFilename)
+                                Log.e("GeekDS", "Download verification failed: $storageFilename - exists=$finalExists, size=$finalSize vs $totalBytes, readable=$finalReadable")
                                 file.delete() // Clean up corrupt file
                                 callback(false)
                             }
                         } else {
-                            activeDownloads.remove(filename)
-                            Log.e("GeekDS", "Failed to move temp file: $filename (temp exists=${tempFile.exists()}, final exists=${file.exists()})")
+                            activeDownloads.remove(storageFilename)
+                            Log.e("GeekDS", "Failed to move temp file: $storageFilename (temp exists=${tempFile.exists()}, final exists=${file.exists()})")
                             tempFile.delete()
                             callback(false)
                         }
                     } else {
-                        activeDownloads.remove(filename)
-                        Log.e("GeekDS", "Download produced empty file: $filename")
+                        activeDownloads.remove(storageFilename)
+                        Log.e("GeekDS", "Download produced empty file: $storageFilename")
                         tempFile.delete()
                         callback(false)
                     }
                 } catch (e: Exception) {
-                    activeDownloads.remove(filename)
-                    Log.e("GeekDS", "Error saving file: $filename", e)
+                    activeDownloads.remove(storageFilename)
+                    Log.e("GeekDS", "Error saving file: $storageFilename", e)
                     // Clean up any partial files
                     file.delete()
-                    File(file.parent, "${filename}.tmp").delete()
+                    File(file.parent, "${storageFilename}.tmp").delete()
                     callback(false)
                 }
             }
@@ -2349,7 +2361,7 @@ class MainActivity : Activity() {
 
                     // Check if media files need to be downloaded before playback
                     val filesToDownload = cachedPlaylist.mediaFiles.filter { mediaFile ->
-                        val file = File(getExternalFilesDir(null), mediaFile.filename)
+                        val file = File(getExternalFilesDir(null), mediaFile.getStorageFilename())
                         !file.exists() || file.length() == 0L
                     }
 
@@ -2464,12 +2476,12 @@ class MainActivity : Activity() {
         try {
             // Check if all files exist locally and are complete
             val availableFiles = playlist.mediaFiles.filter { mediaFile ->
-                val file = File(getExternalFilesDir(null), mediaFile.filename)
+                val file = File(getExternalFilesDir(null), mediaFile.getStorageFilename())
                 val exists = file.exists()
                 val size = if (exists) file.length() else 0
                 val canRead = if (exists) file.canRead() else false
 
-                Log.i("GeekDS", "File check: ${mediaFile.filename}, exists=$exists, size=$size, canRead=$canRead, path=${file.absolutePath}")
+                Log.i("GeekDS", "File check: ${mediaFile.getStorageFilename()}, exists=$exists, size=$size, canRead=$canRead, path=${file.absolutePath}")
 
                 // File must exist, have content, and be readable
                 exists && size > 0 && canRead
@@ -2533,7 +2545,7 @@ class MainActivity : Activity() {
 
                 // Build MediaItem list from available files only
                 val mediaItems = availableFiles.map { mediaFile ->
-                    val file = File(getExternalFilesDir(null), mediaFile.filename)
+                    val file = File(getExternalFilesDir(null), mediaFile.getStorageFilename())
 
                     // Use Android Uri.fromFile() instead of file.toURI().toString() for better compatibility
                     val uri = android.net.Uri.fromFile(file)
@@ -2774,10 +2786,14 @@ class MainActivity : Activity() {
     )
 
     data class MediaFile(
+        val id: Int,         // Media ID from database (for unique identification)
         val filename: String,
         val duration: Int, // seconds
         val type: String
-    )
+    ) {
+        // Generate unique storage filename combining ID and original filename
+        fun getStorageFilename(): String = "${id}-${filename}"
+    }
 
 // Local storage helpers
 

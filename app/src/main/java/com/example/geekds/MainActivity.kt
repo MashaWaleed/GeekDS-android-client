@@ -856,7 +856,7 @@ class MainActivity : Activity() {
                     // CRITICAL: This must run even if scheduleChanged is true!
                     if (playlistChanged && currentPlaylistId != null) {
                         Log.i("GeekDS", "🔄 Playlist content changed for playlist $currentPlaylistId - reloading")
-                        fetchPlaylist(currentPlaylistId!!)
+                        fetchPlaylist(currentPlaylistId!!, forceRedownload = true)
                     }
                 } catch (e: Exception) {
                     Log.e("GeekDS", "Error parsing unified heartbeat response", e)
@@ -1012,17 +1012,48 @@ class MainActivity : Activity() {
                     }
 
                     val playlist = Playlist(id = playlistId, mediaFiles = mediaFiles)
+                    val playlistTimestamp = obj.optString("updated_at")
+                    val cachedUpdatedAt = getCachedPlaylistUpdatedAt(playlistId)
+                    val forceRefresh = cachedUpdatedAt != null &&
+                            playlistTimestamp.isNotEmpty() &&
+                            playlistTimestamp != cachedUpdatedAt
+
                     savePlaylistById(this@MainActivity, playlistId, playlist)
                     Log.i("GeekDS", "📋 Cached playlist $playlistId with ${mediaFiles.size} files: ${mediaFiles.map { "${it.id}-${it.filename}" }}")
 
-                    // Start downloading media files in background for offline use
-                    mediaFiles.forEach { mediaFile ->
+                    if (forceRefresh) {
+                        Log.i("GeekDS", "Playlist $playlistId revision changed during pre-cache - refreshing media files")
+                    }
+
+                    var completedDownloads = 0
+                    var successfulDownloads = 0
+                    val filesNeedingDownload = mediaFiles.filter { mediaFile ->
                         val file = File(getExternalFilesDir(null), mediaFile.getStorageFilename())
-                        if (!file.exists() || file.length() == 0L) {
-                            downloadMediaWithCallback(mediaFile.getStorageFilename(), mediaFile.filename) { success ->
-                                if (success) {
-                                    Log.i("GeekDS", "Pre-downloaded media: ${mediaFile.getStorageFilename()}")
-                                }
+                        if (forceRefresh && file.exists()) {
+                            file.delete()
+                        }
+                        forceRefresh || !file.exists() || file.length() == 0L
+                    }
+
+                    if (filesNeedingDownload.isEmpty()) {
+                        if (playlistTimestamp.isNotEmpty()) {
+                            saveCachedPlaylistUpdatedAt(playlistId, playlistTimestamp)
+                        }
+                        return
+                    }
+
+                    filesNeedingDownload.forEach { mediaFile ->
+                        downloadMediaWithCallback(mediaFile.getStorageFilename(), mediaFile.filename) { success ->
+                            completedDownloads++
+                            if (success) {
+                                successfulDownloads++
+                                Log.i("GeekDS", "Pre-downloaded media: ${mediaFile.getStorageFilename()}")
+                            }
+                            if (completedDownloads == filesNeedingDownload.size &&
+                                successfulDownloads == filesNeedingDownload.size &&
+                                playlistTimestamp.isNotEmpty()
+                            ) {
+                                saveCachedPlaylistUpdatedAt(playlistId, playlistTimestamp)
                             }
                         }
                     }
@@ -1739,7 +1770,7 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun fetchPlaylist(playlistId: Int) {
+    private fun fetchPlaylist(playlistId: Int, forceRedownload: Boolean = false) {
         setState(State.SYNCING, "Fetching playlist $playlistId...")
         val req = Request.Builder()
             .url("$cmsUrl/api/playlists/$playlistId")
@@ -1759,11 +1790,7 @@ class MainActivity : Activity() {
                 val obj = JSONObject(resp)
 
                 val playlistTimestamp = obj.optString("updated_at")
-                Log.i("GeekDS", "Processing playlist response...")
-
-                // Always process the playlist data, regardless of timestamp
-                // Track if this update affects the current playlist
-                val isCurrentPlaylist = playlistId == currentPlaylistId
+                Log.i("GeekDS", "Processing playlist response (updated_at=$playlistTimestamp, forceRedownload=$forceRedownload)...")
 
                 // Use media_details if available, fallback to media_files
                 val mediaDetailsJson = obj.optJSONArray("media_details")
@@ -1805,51 +1832,80 @@ class MainActivity : Activity() {
                     Log.i("GeekDS", "  [$index] ${file.filename} (${file.duration}s, ${file.type})")
                 }
 
-                // Check if playlist content actually changed by comparing with saved playlist
                 val savedPlaylist = loadPlaylist(this@MainActivity)
                 val contentChanged = savedPlaylist == null ||
                         savedPlaylist.mediaFiles.size != playlist.mediaFiles.size ||
                         savedPlaylist.mediaFiles.zip(playlist.mediaFiles).any { (old, new) ->
-                            old.filename != new.filename
+                            old.id != new.id || old.filename != new.filename
                         }
 
+                val cachedUpdatedAt = getCachedPlaylistUpdatedAt(playlistId)
+                val playlistRevisionChanged = cachedUpdatedAt != null &&
+                        playlistTimestamp.isNotEmpty() &&
+                        playlistTimestamp != cachedUpdatedAt
+
+                val needsMediaRefresh = forceRedownload || playlistRevisionChanged || contentChanged
+
                 if (contentChanged) {
-                    Log.i("GeekDS", "🔄 Playlist content CHANGED!")
+                    Log.i("GeekDS", "🔄 Playlist file list CHANGED!")
                     if (savedPlaylist != null) {
                         Log.i("GeekDS", "  Old: ${savedPlaylist.mediaFiles.map { it.filename }}")
                         Log.i("GeekDS", "  New: ${mediaFiles.map { it.filename }}")
                     }
+                } else if (playlistRevisionChanged) {
+                    Log.i("GeekDS", "🔄 Playlist revision changed ($cachedUpdatedAt -> $playlistTimestamp)")
                 } else {
-                    Log.i("GeekDS", "✓ Playlist content unchanged")
+                    Log.i("GeekDS", "✓ Playlist metadata unchanged")
                 }
 
                 savePlaylist(this@MainActivity, playlist)
 
-                // Download media - the download process will handle starting playback when ready
-                Log.i("GeekDS", "Starting media download for playlist $playlistId with ${mediaFiles.size} files (content changed: $contentChanged)")
+                Log.i(
+                    "GeekDS",
+                    "Playlist refresh decision: needsMediaRefresh=$needsMediaRefresh " +
+                            "(force=$forceRedownload, revision=$playlistRevisionChanged, content=$contentChanged)"
+                )
 
-                // Only proceed if this differs from current or not yet active OR content changed
-                val shouldDownload = !isPlaylistActive || currentPlaylistId != playlistId || player == null || contentChanged
-                if (shouldDownload) {
-                    downloadPlaylistMedia(playlist)
+                if (needsMediaRefresh || !isPlaylistActive || currentPlaylistId != playlistId || player == null) {
+                    downloadPlaylistMedia(
+                        playlist,
+                        forceRedownload = needsMediaRefresh,
+                        onRefreshComplete = {
+                            if (playlistTimestamp.isNotEmpty()) {
+                                saveCachedPlaylistUpdatedAt(playlistId, playlistTimestamp)
+                                Log.i("GeekDS", "Saved playlist $playlistId updated_at=$playlistTimestamp")
+                            }
+                        }
+                    )
                     setState(State.IDLE, "Media synced. Downloading files...")
                 } else {
                     Log.i("GeekDS", "Playlist unchanged and already playing – skipping reload")
+                    if (playlistTimestamp.isNotEmpty() && cachedUpdatedAt == null) {
+                        saveCachedPlaylistUpdatedAt(playlistId, playlistTimestamp)
+                        Log.i("GeekDS", "Seeded playlist $playlistId updated_at=$playlistTimestamp")
+                    }
                     setState(State.IDLE, "Playlist unchanged")
                 }
             }
         })
     }
 
-    private fun downloadPlaylistMedia(playlist: Playlist) {
+    private fun downloadPlaylistMedia(
+        playlist: Playlist,
+        forceRedownload: Boolean = false,
+        onRefreshComplete: (() -> Unit)? = null
+    ) {
         setState(State.SYNCING, "Downloading media files...")
+        isDownloadingMedia = true
         var downloadCount = 0
+        var successCount = 0
         val totalFiles = playlist.mediaFiles.size
         val downloadStartTime = System.currentTimeMillis()
 
         if (totalFiles == 0) {
             setState(State.IDLE, "No media files to download")
             isDownloadingMedia = false
+            onRefreshComplete?.invoke()
             return
         }
 
@@ -1864,47 +1920,59 @@ class MainActivity : Activity() {
         // Track which files we're downloading vs already have
         // Use getStorageFilename() which includes media ID for uniqueness
         val filesToDownload = playlist.mediaFiles.filter { mediaFile ->
-            val file = File(getExternalFilesDir(null), mediaFile.getStorageFilename())
-            !file.exists() || file.length() == 0L
+            if (forceRedownload) {
+                val file = File(getExternalFilesDir(null), mediaFile.getStorageFilename())
+                if (file.exists()) {
+                    val deleted = file.delete()
+                    Log.i("GeekDS", "Force re-download: cleared cached file ${mediaFile.getStorageFilename()} (deleted=$deleted)")
+                }
+                true
+            } else {
+                val file = File(getExternalFilesDir(null), mediaFile.getStorageFilename())
+                !file.exists() || file.length() == 0L
+            }
         }
 
         if (filesToDownload.isEmpty()) {
             Log.i("GeekDS", "All files already downloaded, ready to play")
             setState(State.IDLE, "All media files ready")
             isDownloadingMedia = false
-            // All files are ready, we can start playback immediately if needed
-            triggerPlaybackIfReady(playlist)
+            onRefreshComplete?.invoke()
+            triggerPlaybackIfReady(playlist, forceRestart = forceRedownload)
             return
         }
 
-        Log.i("GeekDS", "Need to download ${filesToDownload.size} files")
+        Log.i("GeekDS", "Need to download ${filesToDownload.size} files (forceRedownload=$forceRedownload)")
 
         filesToDownload.forEach { mediaFile ->
             downloadMediaWithCallback(mediaFile.getStorageFilename(), mediaFile.filename) { success ->
                 downloadCount++
                 if (success) {
+                    successCount++
                     Log.i("GeekDS", "Downloaded: ${mediaFile.getStorageFilename()}")
                 } else {
                     Log.e("GeekDS", "Failed to download: ${mediaFile.getStorageFilename()}")
                 }
 
                 if (downloadCount == filesToDownload.size) {
-                    setState(State.IDLE, "All media files processed ($downloadCount/${filesToDownload.size})")
+                    setState(State.IDLE, "All media files processed ($successCount/${filesToDownload.size})")
                     isDownloadingMedia = false
-                    // All downloads complete, now we can safely start playback
-                    triggerPlaybackIfReady(playlist)
+                    if (successCount == filesToDownload.size) {
+                        onRefreshComplete?.invoke()
+                    }
+                    triggerPlaybackIfReady(playlist, forceRestart = forceRedownload)
                 }
             }
         }
     }
 
     // New method to trigger playback only when files are ready
-    private fun triggerPlaybackIfReady(playlist: Playlist) {
+    private fun triggerPlaybackIfReady(playlist: Playlist, forceRestart: Boolean = false) {
         // Only start playback if we should be playing right now
         if (isPlaylistActive && currentPlaylistId == playlist.id) {
-            Log.i("GeekDS", "Downloads complete - starting playback")
+            Log.i("GeekDS", "Downloads complete - ${if (forceRestart) "restarting" else "starting"} playback")
             runOnUiThread {
-                startPlaylistPlayback(playlist)
+                startPlaylistPlayback(playlist, forceRestart = forceRestart)
             }
         } else {
             Log.i("GeekDS", "Downloads complete but playback not currently needed")
@@ -2470,8 +2538,8 @@ class MainActivity : Activity() {
     }
 
     // Enhanced startPlaylistPlayback method
-    private fun startPlaylistPlayback(playlist: Playlist) {
-        Log.i("GeekDS", ">>> startPlaylistPlayback called with ${playlist.mediaFiles.size} items")
+    private fun startPlaylistPlayback(playlist: Playlist, forceRestart: Boolean = false) {
+        Log.i("GeekDS", ">>> startPlaylistPlayback called with ${playlist.mediaFiles.size} items (forceRestart=$forceRestart)")
 
         try {
             // Check if all files exist locally and are complete
@@ -2858,6 +2926,18 @@ class MainActivity : Activity() {
             Log.e("GeekDS", "Failed to load playlist $playlistId", e)
             null
         }
+    }
+
+    private fun getCachedPlaylistUpdatedAt(playlistId: Int): String? {
+        return getSharedPreferences("geekds_prefs", MODE_PRIVATE)
+            .getString("playlist_${playlistId}_updated_at", null)
+    }
+
+    private fun saveCachedPlaylistUpdatedAt(playlistId: Int, updatedAt: String) {
+        getSharedPreferences("geekds_prefs", MODE_PRIVATE)
+            .edit()
+            .putString("playlist_${playlistId}_updated_at", updatedAt)
+            .apply()
     }
 
     // WebSocket connection management

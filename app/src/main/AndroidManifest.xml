@@ -94,7 +94,7 @@
         </service>
 
         <!-- Install result receiver for silent updates -->
-        <receiver android:name=".MainActivity$InstallResultReceiver"
+        <receiver android:name=".receiver.InstallResultReceiver"
             android:enabled="true"
             android:exported="false">
             <intent-filter>

@@ -1,5 +1,6 @@
 package com.example.geekds
 import android.view.ViewGroup
+import android.widget.FrameLayout
 import androidx.media3.common.MediaItem
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.PlayerView
@@ -402,9 +403,10 @@ internal fun MainActivity.startPlaylistPlayback(playlist: Playlist, forceRestart
             // it's not used for primary rendering or layout anymore.
             Log.i(GeekDsConstants.TAG, "Creating TextureView for video rendering")
             videoTextureView = TextureView(this@startPlaylistPlayback).apply {
-                layoutParams = ViewGroup.LayoutParams(
+                layoutParams = FrameLayout.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT,
-                    ViewGroup.LayoutParams.MATCH_PARENT
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    android.view.Gravity.CENTER
                 )
             }
 
@@ -447,6 +449,15 @@ internal fun MainActivity.startPlaylistPlayback(playlist: Playlist, forceRestart
                     setState(AppState.ERROR, "Playback error: ${error.message}")
                     isPlaylistActive = false
                     showStandby() // Show standby on error
+                }
+
+                override fun onVideoSizeChanged(videoSize: androidx.media3.common.VideoSize) {
+                    currentVideoSize = videoSize
+                    Log.i(
+                        GeekDsConstants.TAG,
+                        "Video size changed: ${videoSize.width}x${videoSize.height} pixelRatio=${videoSize.pixelWidthHeightRatio} unappliedRotation=${videoSize.unappliedRotationDegrees}"
+                    )
+                    applyPlayerRotation(deviceOrientation)
                 }
 
                 override fun onPlaybackStateChanged(playbackState: Int) {

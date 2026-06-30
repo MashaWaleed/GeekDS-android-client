@@ -1,5 +1,9 @@
 package com.example.geekds
+import android.graphics.Matrix
 import android.util.Log
+import android.view.Gravity
+import android.widget.FrameLayout
+import android.widget.LinearLayout
 import com.example.geekds.data.LocalStorage
 
 /**
@@ -101,23 +105,113 @@ internal fun MainActivity.handleOrientationUpdate(newDegrees: Int) {
 }
 
 /**
- * Rotates the live ExoPlayer video surface on the fly. This is a pure view-level
- * transform (View.rotation on the TextureView), NOT a re-encode of the video file -
- * it takes effect immediately on whatever is currently playing.
+ * Maps the video texture into the always-landscape Android framebuffer.
  *
- * IMPORTANT: this rotates `videoTextureView`, not `playerView`. PlayerView defaults
- * to rendering onto a SurfaceView, whose pixel content is composited by hardware in
- * a separate window behind the normal view hierarchy - so View transforms on it only
- * affect its embedding bounds, not the actual picture. TextureView renders through
- * the normal GPU/view pipeline, so View.rotation genuinely rotates its pixel content.
- * See startPlaylistPlayback() for where videoTextureView is created and attached.
- *
- * This applies rotation ONLY - no scaling/stretching to "fill" the rotated bounds.
- * Sizing the video correctly for the target orientation is left entirely to whoever
- * supplies the media (i.e. encode/crop source videos at the dimensions you want for
- * each orientation) rather than this code distorting the aspect ratio to compensate.
+ * Important physical setup:
+ * - The Android TV box/window stays landscape, e.g. 1920x1080.
+ * - The actual TV may be physically rotated to portrait.
+ * - Therefore the player view itself must stay landscape/fullscreen.
+ * - For 90°/270°, we rotate the video pixels INSIDE that landscape view so a
+ *   portrait 1080x1920 video becomes a 1920x1080 image in Android coordinates.
+ *   After the user physically rotates the TV, that appears as full-screen portrait.
  */
 internal fun MainActivity.applyPlayerRotation(degrees: Int) {
     val tv = videoTextureView ?: return
-    tv.rotation = degrees.toFloat()
+    val container = rootContainer ?: return
+
+    val containerWidth = container.width
+    val containerHeight = container.height
+
+    if (containerWidth <= 0 || containerHeight <= 0) {
+        tv.post { applyPlayerRotation(degrees) }
+        return
+    }
+
+    val layoutParams = when (val existing = tv.layoutParams) {
+        is FrameLayout.LayoutParams -> existing.apply {
+            width = containerWidth
+            height = containerHeight
+            gravity = Gravity.CENTER
+        }
+        is LinearLayout.LayoutParams -> existing.apply {
+            width = containerWidth
+            height = containerHeight
+            gravity = Gravity.CENTER
+        }
+        else -> FrameLayout.LayoutParams(containerWidth, containerHeight, Gravity.CENTER)
+    }
+    tv.layoutParams = layoutParams
+
+    // Never rotate/move the Android View itself for playback. Rotating the View creates
+    // an off-screen 1080x1920 bounding box inside a 1920x1080 window, which is exactly
+    // what caused the half-black / half-offscreen behavior.
+    tv.rotation = 0f
+    tv.translationX = 0f
+    tv.translationY = 0f
+    tv.scaleX = 1f
+    tv.scaleY = 1f
+    tv.pivotX = containerWidth / 2f
+    tv.pivotY = containerHeight / 2f
+
+    val videoSize = currentVideoSize
+    val rawVideoWidth = videoSize?.width ?: 0
+    val rawVideoHeight = videoSize?.height ?: 0
+    val pixelRatio = videoSize?.pixelWidthHeightRatio ?: 1f
+
+    if (rawVideoWidth <= 0 || rawVideoHeight <= 0) {
+        tv.setTransform(null)
+        Log.i(
+            GeekDsConstants.TAG,
+            "Reset player transform while waiting for video size: requested=${degrees}° container=${containerWidth}x${containerHeight}"
+        )
+        return
+    }
+
+    val viewWidth = containerWidth.toFloat()
+    val viewHeight = containerHeight.toFloat()
+    val logicalVideoWidth = rawVideoWidth * pixelRatio
+    val logicalVideoHeight = rawVideoHeight.toFloat()
+    val rotated = degrees == 90 || degrees == 270
+    val rotatedVideoWidth = if (rotated) logicalVideoHeight else logicalVideoWidth
+    val rotatedVideoHeight = if (rotated) logicalVideoWidth else logicalVideoHeight
+    val fillScale = maxOf(viewWidth / rotatedVideoWidth, viewHeight / rotatedVideoHeight)
+
+    // TextureView normally stretches the raw video rectangle to the whole View.
+    // These are the on-screen positions of the four video corners BEFORE our transform.
+    val sourceInView = floatArrayOf(
+        0f, 0f,
+        viewWidth, 0f,
+        viewWidth, viewHeight,
+        0f, viewHeight
+    )
+
+    val radians = Math.toRadians(degrees.toDouble())
+    val cos = kotlin.math.cos(radians).toFloat()
+    val sin = kotlin.math.sin(radians).toFloat()
+    val videoCorners = floatArrayOf(
+        0f, 0f,
+        logicalVideoWidth, 0f,
+        logicalVideoWidth, logicalVideoHeight,
+        0f, logicalVideoHeight
+    )
+    val destinationInView = FloatArray(8)
+
+    for (i in 0 until 4) {
+        val x = videoCorners[i * 2] - logicalVideoWidth / 2f
+        val y = videoCorners[i * 2 + 1] - logicalVideoHeight / 2f
+        val rotatedX = x * cos - y * sin
+        val rotatedY = x * sin + y * cos
+        destinationInView[i * 2] = rotatedX * fillScale + viewWidth / 2f
+        destinationInView[i * 2 + 1] = rotatedY * fillScale + viewHeight / 2f
+    }
+
+    val matrix = Matrix()
+    matrix.setPolyToPoly(sourceInView, 0, destinationInView, 0, 4)
+    tv.setTransform(matrix)
+
+    Log.i(
+        GeekDsConstants.TAG,
+        "Applied player texture transform: requested=${degrees}° container=${containerWidth}x${containerHeight} " +
+                "video=${rawVideoWidth}x${rawVideoHeight} pixelRatio=${pixelRatio} fillScale=${fillScale}"
+    )
 }

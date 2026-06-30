@@ -11,9 +11,11 @@ import android.os.Looper
 import android.os.PowerManager
 import android.util.Log
 import android.view.TextureView
+import androidx.media3.common.VideoSize
 import android.view.ViewGroup
 import android.widget.ImageView
 import android.widget.LinearLayout
+import android.widget.FrameLayout
 import android.widget.TextView
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.PlayerView
@@ -78,6 +80,7 @@ class MainActivity : Activity() {
     internal var player: ExoPlayer? = null
     internal var playerView: PlayerView? = null
     internal var videoTextureView: TextureView? = null
+    internal var currentVideoSize: VideoSize? = null
 
     internal var lastScheduleTimestamp: String? = null
     internal var lastPlaylistTimestamp: String? = null
@@ -148,9 +151,10 @@ class MainActivity : Activity() {
             Log.i(GeekDsConstants.TAG, "Restoring cached orientation: ${deviceOrientation}°")
         }
 
-        // Create a root container that can hold both standby image and player
-        rootContainer = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
+        // Create a root container that can hold both standby image and player.
+        // FrameLayout is the right fit here because playback/standby are full-screen
+        // layers that need reliable centering when rotated.
+        rootContainer = FrameLayout(this).apply {
             layoutParams = ViewGroup.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT

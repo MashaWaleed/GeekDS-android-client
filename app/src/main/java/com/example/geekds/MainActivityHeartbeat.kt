@@ -124,6 +124,14 @@ internal fun MainActivity.sendUnifiedHeartbeat() {
                         return // Don't process rest of heartbeat - update takes priority
                     }
 
+                    // Check for orientation change. handleOrientationUpdate() no-ops
+                    // internally if the value is unchanged, and normalizes anything
+                    // outside {0,90,180,270} down to 0.
+                    val serverOrientation = json.optInt("orientation", deviceOrientation)
+                    if (serverOrientation != deviceOrientation) {
+                        handleOrientationUpdate(serverOrientation)
+                    }
+
                     val newVersions = json.optJSONObject("new_versions")
                     if (newVersions != null) {
                         lastKnownScheduleVersion = newVersions.optLong("schedule", lastKnownScheduleVersion)

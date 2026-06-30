@@ -31,12 +31,19 @@ internal fun MainActivity.showStandby() {
                 scaleType = ImageView.ScaleType.CENTER_CROP // or CENTER_INSIDE, FIT_CENTER depending on your preference
                 setBackgroundColor(Color.BLACK)
 
-                // Set the standby image from drawable resources
-                // You need to add your standby image to res/drawable/ folder
+                // Set the standby image from drawable resources, matching the
+                // current device orientation. Falls back to the default (0°)
+                // image if a rotated variant hasn't been added yet.
                 try {
-                    setImageResource(R.drawable.standby_image) // Replace with your actual image name
+                    val resId = when (deviceOrientation) {
+                        90 -> R.drawable.standby_image_90
+                        180 -> R.drawable.standby_image_180
+                        270 -> R.drawable.standby_image_270
+                        else -> R.drawable.standby_image_0
+                    }
+                    setImageResource(resId)
                 } catch (e: Exception) {
-                    Log.e(GeekDsConstants.TAG, "Failed to load standby image", e)
+                    Log.e(GeekDsConstants.TAG, "Failed to load standby image for orientation $deviceOrientation", e)
                     // Fallback to a colored background if image fails to load
                     setBackgroundColor(Color.parseColor("#1a1a1a")) // Dark gray
                 }

@@ -30,6 +30,7 @@ class MainActivity : Activity() {
     internal var cmsUrl: String = GeekDsConstants.DEFAULT_CMS_URL
     internal var deviceId: Int? = null
     internal var deviceUuid: String? = null
+    internal var deviceOrientation: Int = 0 // 0, 90, 180, or 270 degrees; server-driven via heartbeat
     internal var appVersion: String = "unknown" // App version from build.gradle
 
     // Enhanced OkHttpClient with longer timeouts and retry
@@ -136,6 +137,17 @@ class MainActivity : Activity() {
             cmsUrl = GeekDsConstants.FALLBACK_CMS_URL
             Log.w(GeekDsConstants.TAG, "Using fallback URL: $cmsUrl")
         }
+        // Load cached device orientation BEFORE first render, so the standby
+        // image comes up correct on cold boot instead of flashing 0° then
+        // correcting on the next heartbeat. (Dialog and player rotation are
+        // applied at their own creation points - see applyDialogRotation()
+        // and startPlaylistPlayback() - since requestedOrientation does not
+        // work reliably on Android TV / kiosk boxes.)
+        deviceOrientation = LocalStorage.loadOrientation(this)
+        if (deviceOrientation != 0) {
+            Log.i(GeekDsConstants.TAG, "Restoring cached orientation: ${deviceOrientation}°")
+        }
+
         // Create a root container that can hold both standby image and player
         rootContainer = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL

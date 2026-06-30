@@ -100,6 +100,7 @@ internal fun MainActivity.showWaitingDialog() {
             .setMessage("Requesting registration code from server...\n\nPlease wait...")
             .setCancelable(false)
             .show()
+        applyDialogRotation(deviceOrientation)
     }
 
 internal fun MainActivity.requestRegistrationCode() {
@@ -166,6 +167,7 @@ internal fun MainActivity.showErrorDialog(title: String, message: String) {
             }
             .setCancelable(false)
             .show()
+        applyDialogRotation(deviceOrientation)
     }
 
 internal fun MainActivity.startRegistrationPolling(ip: String) {
@@ -242,6 +244,7 @@ internal fun MainActivity.showRegistrationDialog(code: String) {
             }
             .setCancelable(false)
             .show()
+        applyDialogRotation(deviceOrientation)
     }
 
 internal fun MainActivity.showNetworkInfo() {
@@ -266,4 +269,5 @@ internal fun MainActivity.showNetworkInfo() {
             }
             .setCancelable(false)
             .show()
+        applyDialogRotation(deviceOrientation)
     }

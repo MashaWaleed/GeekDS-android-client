@@ -85,6 +85,15 @@ object LocalStorage {
         return prefs(context).getString("device_uuid", null)
     }
 
+    fun saveOrientation(context: Context, degrees: Int) {
+        prefs(context).edit().putInt("device_orientation", degrees).apply()
+        Log.i(GeekDsConstants.TAG, "Device orientation saved: ${degrees}°")
+    }
+
+    fun loadOrientation(context: Context): Int {
+        return prefs(context).getInt("device_orientation", 0)
+    }
+
     private fun prefs(context: Context) =
         context.getSharedPreferences(GeekDsConstants.PREFS_NAME, Context.MODE_PRIVATE)
 }

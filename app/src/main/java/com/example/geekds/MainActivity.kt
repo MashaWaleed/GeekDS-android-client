@@ -17,6 +17,7 @@ import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.FrameLayout
 import android.widget.TextView
+import com.example.geekds.model.AdsConfig
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.PlayerView
 import com.example.geekds.config.AppConfig
@@ -44,6 +45,16 @@ class MainActivity : Activity() {
     internal var isPlaylistActive = false
     internal var currentPlaylistId: Int? = null
     internal var isDownloadingMedia = false // Prevent download loop
+
+    // Content-drift detection: the set of media-file IDs that the CURRENT
+    // ExoPlayer instance was built from. enforceScheduleWithMultiple compares
+    // this against the cached playlist's media IDs on each 3s pass; if they
+    // differ (e.g. a media file was added/removed from the playlist but the
+    // player was never rebuilt), it forces a rebuild even though the playlist
+    // ID hasn't changed. This is the safety net that catches the case where
+    // the heartbeat advanced the version but the reload didn't rebuild the
+    // player.
+    internal var currentPlayingMediaIds: Set<Int> = emptySet()
     // Add these new properties for standby managementP
     internal var standbyImageView: ImageView? = null
     internal var rootContainer: ViewGroup? = null
@@ -73,6 +84,16 @@ class MainActivity : Activity() {
     // Track in-progress downloads to prevent concurrent downloads of same file
     internal val activeDownloads = Collections.synchronizedSet(mutableSetOf<String>())
 
+    // Pending callbacks for downloads that are already in progress. When a
+    // duplicate download request comes in while the same file is being fetched
+    // by another path (e.g. heartbeat reload vs. schedule pre-cache), instead
+    // of reporting a false "failure", we queue the callback here and invoke it
+    // with the SAME result as the original download when it completes. This
+    // prevents the false-failure counting that previously skipped the
+    // updated_at persistence and caused premature "no reload" dead-ends.
+    internal val pendingDownloadCallbacks =
+        Collections.synchronizedMap(mutableMapOf<String, MutableList<(Boolean) -> Unit>>())
+
     internal var state: AppState = AppState.REGISTERING
     internal val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
     internal var scheduleEnforcerJob: Job? = null
@@ -81,6 +102,18 @@ class MainActivity : Activity() {
     internal var playerView: PlayerView? = null
     internal var videoTextureView: TextureView? = null
     internal var currentVideoSize: VideoSize? = null
+
+    internal var adPlayer: ExoPlayer? = null
+    internal var adTextureView: TextureView? = null
+    internal var adImageView: ImageView? = null
+    internal var tickerTextView: TextView? = null
+    internal var clockTextView: TextView? = null
+    internal var tickerClockJob: Job? = null
+    internal var isAdsLayoutActive: Boolean = false
+    internal var currentAdsConfig: AdsConfig? = null
+    internal var lastKnownAdsVersion: Long = 0L
+    internal var isFetchingAdsConfig: Boolean = false
+    internal var isDownloadingAdsMedia: Boolean = false
 
     internal var lastScheduleTimestamp: String? = null
     internal var lastPlaylistTimestamp: String? = null
@@ -149,6 +182,12 @@ class MainActivity : Activity() {
         deviceOrientation = LocalStorage.loadOrientation(this)
         if (deviceOrientation != 0) {
             Log.i(GeekDsConstants.TAG, "Restoring cached orientation: ${deviceOrientation}°")
+        }
+
+        lastKnownAdsVersion = LocalStorage.loadAdsVersion(this)
+        currentAdsConfig = LocalStorage.loadAdsConfig(this)
+        if (lastKnownAdsVersion > 0L) {
+            Log.i(GeekDsConstants.TAG, "Restoring cached ads version: $lastKnownAdsVersion")
         }
 
         // Create a root container that can hold both standby image and player.

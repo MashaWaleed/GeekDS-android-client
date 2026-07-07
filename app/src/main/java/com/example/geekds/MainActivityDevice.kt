@@ -13,6 +13,8 @@ internal fun MainActivity.clearDeviceRegistration() {
         lastKnownScheduleVersion = 0
         lastKnownPlaylistVersion = 0
         lastAllSchedulesVersion = 0
+        lastKnownAdsVersion = 0
+        currentAdsConfig = null
 
         val sharedPrefs = getSharedPreferences("DevicePrefs", Context.MODE_PRIVATE)
         with(sharedPrefs.edit()) {
@@ -77,7 +79,10 @@ internal fun MainActivity.stopAllActivities() {
                     player?.release()
                     player = null
                     playerView = null
-                    videoTextureView = null                    // Show standby screen
+                    videoTextureView = null
+                    currentVideoSize = null
+                    releaseAdPlayback()
+                    // Show standby screen
                     showStandby()
 
                     Log.i(GeekDsConstants.TAG, "All activities stopped for re-registration")

@@ -64,6 +64,7 @@ internal fun MainActivity.sendUnifiedHeartbeat() {
                 put("schedule", lastKnownScheduleVersion)
                 put("playlist", lastKnownPlaylistVersion)
                 put("all_schedules", lastAllSchedulesVersion)
+                put("ads", lastKnownAdsVersion)
             })
             put("name", deviceName)
             put("ip", ip)
@@ -133,9 +134,17 @@ internal fun MainActivity.sendUnifiedHeartbeat() {
                     }
 
                     val newVersions = json.optJSONObject("new_versions")
+                    // Save the server-reported playlist version but DON'T commit
+                    // it to lastKnownPlaylistVersion yet. We only advance the
+                    // local version AFTER the reload actually rebuilds the
+                    // player (via fetchPlaylist's onRefreshComplete). If we
+                    // advance it here and the reload fails or doesn't rebuild,
+                    // no future heartbeat will ever detect the change again —
+                    // which was the root cause of the "stuck shuffling old
+                    // media" heisenbug.
+                    val pendingPlaylistVersion = newVersions?.optLong("playlist", lastKnownPlaylistVersion) ?: lastKnownPlaylistVersion
                     if (newVersions != null) {
                         lastKnownScheduleVersion = newVersions.optLong("schedule", lastKnownScheduleVersion)
-                        lastKnownPlaylistVersion = newVersions.optLong("playlist", lastKnownPlaylistVersion)
 
                         // Track all_schedules version for detecting edits to inactive schedules
                         val serverAllSchedulesVersion = newVersions.optLong("all_schedules", 0L)
@@ -144,13 +153,37 @@ internal fun MainActivity.sendUnifiedHeartbeat() {
                             // DON'T update lastAllSchedulesVersion here!
                             // It will be updated in fetchDeviceSchedule() AFTER successful cache
                         }
+
+                        // Do not update lastKnownAdsVersion from this summary alone.
+                        // We only acknowledge an ads version after /api/ads/config/:deviceId
+                        // is fetched, saved, and any referenced media download has been started.
+                        val serverAdsVersion = newVersions.optLong("ads", 0L)
+                        if (serverAdsVersion > 0 && serverAdsVersion != lastKnownAdsVersion) {
+                            Log.i(GeekDsConstants.TAG, "Ads version differs: local=$lastKnownAdsVersion server=$serverAdsVersion")
+                        }
                     }
                     val scheduleChanged = json.optBoolean("schedule_changed", false)
                     val playlistChanged = json.optBoolean("playlist_changed", false)
                     val activePlaylistId = json.optInt("active_playlist_id", -1)
 
-                    if (scheduleChanged || playlistChanged) {
-                        Log.i(GeekDsConstants.TAG, "🔔 Changes detected - schedule: $scheduleChanged, playlist: $playlistChanged, activePlaylistId: $activePlaylistId")
+                    val adsSummary = json.optJSONObject("ads")
+                    val adsChanged = adsSummary?.optBoolean("changed", false) ?: false
+                    val adsEnabled = adsSummary?.optBoolean("enabled", currentAdsConfig?.enabled ?: false) ?: false
+                    val adsExcluded = adsSummary?.optBoolean("excluded", currentAdsConfig?.excluded ?: false) ?: false
+
+                    if (scheduleChanged || playlistChanged || adsChanged) {
+                        Log.i(
+                            GeekDsConstants.TAG,
+                            "🔔 Changes detected - schedule: $scheduleChanged, playlist: $playlistChanged, ads: $adsChanged, activePlaylistId: $activePlaylistId"
+                        )
+                    }
+
+                    if (adsChanged) {
+                        Log.i(GeekDsConstants.TAG, "🔄 Ads config changed - fetching full ads config")
+                        fetchAdsConfig()
+                    } else if (currentAdsConfig == null && adsEnabled && !adsExcluded) {
+                        Log.i(GeekDsConstants.TAG, "Ads enabled but no local config cached - fetching once")
+                        fetchAdsConfig()
                     }
 
                     // Update device name if server sends it back
@@ -209,7 +242,23 @@ internal fun MainActivity.sendUnifiedHeartbeat() {
                     // CRITICAL: This must run even if scheduleChanged is true!
                     if (playlistChanged && currentPlaylistId != null) {
                         Log.i(GeekDsConstants.TAG, "🔄 Playlist content changed for playlist $currentPlaylistId - reloading")
-                        fetchPlaylist(currentPlaylistId!!, forceRedownload = true)
+                        fetchPlaylist(
+                            currentPlaylistId!!,
+                            forceRedownload = true,
+                            onPlaylistReloaded = {
+                                // Only NOW do we acknowledge the new playlist
+                                // version — the player has been (or will be)
+                                // rebuilt from the fresh content. If the reload
+                                // failed, the version stays at the old value and
+                                // the NEXT heartbeat will detect the change
+                                // again and retry.
+                                lastKnownPlaylistVersion = pendingPlaylistVersion
+                            }
+                        )
+                    } else {
+                        // No playlist change reported — safe to advance the
+                        // version now (the server says nothing changed).
+                        lastKnownPlaylistVersion = pendingPlaylistVersion
                     }
                 } catch (e: Exception) {
                     Log.e(GeekDsConstants.TAG, "Error parsing unified heartbeat response", e)

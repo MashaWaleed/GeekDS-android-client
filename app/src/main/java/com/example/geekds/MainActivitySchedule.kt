@@ -18,6 +18,12 @@ internal fun MainActivity.stopCurrentPlayback() {
         }
         player = null
         playerView = null
+        videoTextureView = null
+        currentVideoSize = null
+        // Clear the content signature so the drift check in
+        // enforceScheduleWithMultiple starts fresh after a stop.
+        currentPlayingMediaIds = emptySet()
+        releaseAdPlayback()
 
         // Show standby screen with image
         showStandby()
@@ -128,6 +134,44 @@ internal fun MainActivity.enforceScheduleWithMultiple(schedules: List<Schedule>)
 
             Log.i(GeekDsConstants.TAG, "needsSwitch=$needsSwitch (playing=${isPlaylistActive}, current=$currentPlaylistId vs target=${activeSchedule.playlistId})")
 
+            // Content-drift detection: even if the playlist ID hasn't changed
+            // and we're "active", the PLAYLIST CONTENT may have changed (media
+            // added/removed) without the player being rebuilt. Compare the
+            // cached playlist's media IDs against what the current player was
+            // built from; if they differ, we need a rebuild — BUT only do the
+            // rebuild when ALL files are present, so the old player keeps
+            // running uninterrupted while downloads complete. If files are
+            // still missing, just make sure the download is in progress.
+            if (!needsSwitch) {
+                val cachedCheck = LocalStorage.loadPlaylistById(this@enforceScheduleWithMultiple, activeSchedule.playlistId)
+                if (cachedCheck != null) {
+                    val cachedIds = cachedCheck.mediaFiles.map { it.id }.toSet()
+                    if (cachedIds != currentPlayingMediaIds) {
+                        val allFilesPresent = cachedCheck.mediaFiles.all { mf ->
+                            val f = File(getExternalFilesDir(null), mf.getStorageFilename())
+                            f.exists() && f.length() > 0L && f.canRead()
+                        }
+                        if (allFilesPresent) {
+                            Log.w(
+                                GeekDsConstants.TAG,
+                                "⚠️ CONTENT DRIFT: all files present, rebuilding playback (player={${currentPlayingMediaIds.joinToString()}} -> cached={${cachedIds.joinToString()}})"
+                            )
+                            LocalStorage.savePlaylist(this@enforceScheduleWithMultiple, cachedCheck)
+                            runOnUiThread {
+                                startPlaylistPlayback(cachedCheck, forceRestart = true)
+                            }
+                        } else if (!isDownloadingMedia) {
+                            Log.w(
+                                GeekDsConstants.TAG,
+                                "⚠️ CONTENT DRIFT: files still missing, starting download (keeping old playback running)"
+                            )
+                            isDownloadingMedia = true
+                            downloadPlaylistMedia(cachedCheck)
+                        }
+                    }
+                }
+            }
+
             if (needsSwitch) {
                 Log.i(GeekDsConstants.TAG, "*** PLAYLIST SWITCH NEEDED: ${currentPlaylistId} -> ${activeSchedule.playlistId} ***")
 
@@ -184,7 +228,7 @@ internal fun MainActivity.enforceScheduleWithMultiple(schedules: List<Schedule>)
                 Log.i(GeekDsConstants.TAG, "*** STOPPING PLAYBACK *** - no active schedule")
                 isPlaylistActive = false
                 currentPlaylistId = null
-                runOnUiThread { showStandby() }
+                runOnUiThread { stopCurrentPlayback() }
             }
         }
     }

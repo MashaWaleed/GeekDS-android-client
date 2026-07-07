@@ -13,7 +13,11 @@ import com.example.geekds.data.LocalStorage
 import com.example.geekds.model.*
 import com.example.geekds.util.NetworkUtils
 
-internal fun MainActivity.fetchPlaylist(playlistId: Int, forceRedownload: Boolean = false) {
+internal fun MainActivity.fetchPlaylist(
+    playlistId: Int,
+    forceRedownload: Boolean = false,
+    onPlaylistReloaded: (() -> Unit)? = null
+) {
     setState(AppState.SYNCING, "Fetching playlist $playlistId...")
     val req = Request.Builder()
         .url("$cmsUrl/api/playlists/$playlistId")
@@ -102,6 +106,11 @@ internal fun MainActivity.fetchPlaylist(playlistId: Int, forceRedownload: Boolea
             }
 
             LocalStorage.savePlaylist(this@fetchPlaylist, playlist)
+            // ALSO keep the per-id cache fresh: enforceSchedule reads via
+            // loadPlaylistById, and a stale by-id copy was the reason a later
+            // schedule switch/reenable rebuilt the player from the OLD media
+            // list even after the heartbeat already downloaded new media.
+            LocalStorage.savePlaylistById(this@fetchPlaylist, playlistId, playlist)
 
             Log.i(
                 "GeekDS",
@@ -118,6 +127,10 @@ internal fun MainActivity.fetchPlaylist(playlistId: Int, forceRedownload: Boolea
                             LocalStorage.saveCachedPlaylistUpdatedAt(this@fetchPlaylist, playlistId, playlistTimestamp)
                             Log.i(GeekDsConstants.TAG, "Saved playlist $playlistId updated_at=$playlistTimestamp")
                         }
+                        // Notify the caller (e.g. the heartbeat) that the
+                        // playlist content has been refreshed and the player
+                        // has been (or will be) rebuilt from the new content.
+                        onPlaylistReloaded?.invoke()
                     }
                 )
                 setState(AppState.IDLE, "Media synced. Downloading files...")
@@ -128,6 +141,9 @@ internal fun MainActivity.fetchPlaylist(playlistId: Int, forceRedownload: Boolea
                     Log.i(GeekDsConstants.TAG, "Seeded playlist $playlistId updated_at=$playlistTimestamp")
                 }
                 setState(AppState.IDLE, "Playlist unchanged")
+                // No reload needed — content is the same, so it's safe to
+                // acknowledge the new version.
+                onPlaylistReloaded?.invoke()
             }
         }
     })
@@ -160,20 +176,15 @@ internal fun MainActivity.downloadPlaylistMedia(
         }
     }, 120_000L)
 
-    // Track which files we're downloading vs already have
-    // Use getStorageFilename() which includes media ID for uniqueness
+    // Only download files that are genuinely missing or empty. We NEVER
+    // delete existing valid files — the old player should keep playing
+    // whatever it has until the new content is fully downloaded and verified.
+    // Previously forceRedownload=true would delete EVERYTHING including
+    // unchanged files (like standby images), leaving nothing to play during
+    // the download window and causing the hated stop/start/stop/start loop.
     val filesToDownload = playlist.mediaFiles.filter { mediaFile ->
-        if (forceRedownload) {
-            val file = File(getExternalFilesDir(null), mediaFile.getStorageFilename())
-            if (file.exists()) {
-                val deleted = file.delete()
-                Log.i(GeekDsConstants.TAG, "Force re-download: cleared cached file ${mediaFile.getStorageFilename()} (deleted=$deleted)")
-            }
-            true
-        } else {
-            val file = File(getExternalFilesDir(null), mediaFile.getStorageFilename())
-            !file.exists() || file.length() == 0L
-        }
+        val file = File(getExternalFilesDir(null), mediaFile.getStorageFilename())
+        !file.exists() || file.length() == 0L
     }
 
     if (filesToDownload.isEmpty()) {
@@ -229,14 +240,35 @@ internal fun MainActivity.downloadMediaWithCallback(storageFilename: String, ori
         return
     }
 
-    // Check if download already in progress for this file
+    // Check if download already in progress for this file. Instead of reporting a
+    // false "failure" (which previously made downloadPlaylistMedia count it as a
+    // failed download and skip persisting playlist updated_at), we queue this
+    // callback and invoke it with the SAME result as the original download once
+    // it finishes. This keeps concurrent pre-cache vs. heartbeat reload paths
+    // from racing each other into a "no reload" dead-end.
     if (!activeDownloads.add(storageFilename)) {
-        Log.w(GeekDsConstants.TAG, "Download already in progress for: $storageFilename - skipping duplicate request")
-        callback(false)
+        Log.i(GeekDsConstants.TAG, "Download already in progress for: $storageFilename - queueing callback")
+        synchronized(pendingDownloadCallbacks) {
+            pendingDownloadCallbacks
+                .getOrPut(storageFilename) { mutableListOf() }
+                .add(callback)
+        }
         return
     }
 
     Log.i(GeekDsConstants.TAG, "Starting download: $storageFilename (from server: $originalFilename)")
+
+    // Wrapped result reporter: removes the active-download marker and invokes
+    // both the original callback AND any callbacks queued by concurrent
+    // duplicate requests (see the dedup block above), all with the SAME result.
+    val reportResult: (Boolean) -> Unit = { success ->
+        activeDownloads.remove(storageFilename)
+        val queued = synchronized(pendingDownloadCallbacks) {
+            pendingDownloadCallbacks.remove(storageFilename)
+        }
+        callback(success)
+        queued?.forEach { it(success) }
+    }
 
     // URL encode the ORIGINAL filename to fetch from server
     val encodedFilename = java.net.URLEncoder.encode(originalFilename, "UTF-8").replace("+", "%20")
@@ -248,24 +280,21 @@ internal fun MainActivity.downloadMediaWithCallback(storageFilename: String, ori
         .build()
     client.newCall(req).enqueue(object : Callback {
         override fun onFailure(call: Call, e: IOException) {
-            activeDownloads.remove(storageFilename)
             Log.e(GeekDsConstants.TAG, "Download failed: $storageFilename $e")
-            callback(false)
+            reportResult(false)
         }
 
         override fun onResponse(call: Call, response: Response) {
             if (!response.isSuccessful) {
-                activeDownloads.remove(storageFilename)
                 Log.e(GeekDsConstants.TAG, "Download failed: $storageFilename ${response.code}")
-                callback(false)
+                reportResult(false)
                 return
             }
             try {
                 val responseBody = response.body
                 if (responseBody == null) {
-                    activeDownloads.remove(storageFilename)
                     Log.e(GeekDsConstants.TAG, "Download failed: $storageFilename - no response body")
-                    callback(false)
+                    reportResult(false)
                     return
                 }
 
@@ -304,33 +333,28 @@ internal fun MainActivity.downloadMediaWithCallback(storageFilename: String, ori
                         Log.d(GeekDsConstants.TAG, "Verification: exists=$finalExists, size=$finalSize (expected=$totalBytes), readable=$finalReadable")
 
                         if (finalExists && finalSize == totalBytes && finalReadable) {
-                            activeDownloads.remove(storageFilename)
-                            callback(true)
+                            reportResult(true)
                         } else {
-                            activeDownloads.remove(storageFilename)
                             Log.e(GeekDsConstants.TAG, "Download verification failed: $storageFilename - exists=$finalExists, size=$finalSize vs $totalBytes, readable=$finalReadable")
                             file.delete() // Clean up corrupt file
-                            callback(false)
+                            reportResult(false)
                         }
                     } else {
-                        activeDownloads.remove(storageFilename)
                         Log.e(GeekDsConstants.TAG, "Failed to move temp file: $storageFilename (temp exists=${tempFile.exists()}, final exists=${file.exists()})")
                         tempFile.delete()
-                        callback(false)
+                        reportResult(false)
                     }
                 } else {
-                    activeDownloads.remove(storageFilename)
                     Log.e(GeekDsConstants.TAG, "Download produced empty file: $storageFilename")
                     tempFile.delete()
-                    callback(false)
+                    reportResult(false)
                 }
             } catch (e: Exception) {
-                activeDownloads.remove(storageFilename)
                 Log.e(GeekDsConstants.TAG, "Error saving file: $storageFilename", e)
                 // Clean up any partial files
                 file.delete()
                 File(file.parent, "${storageFilename}.tmp").delete()
-                callback(false)
+                reportResult(false)
             }
         }
     })
@@ -363,10 +387,29 @@ internal fun MainActivity.startPlaylistPlayback(playlist: Playlist, forceRestart
             return
         }
 
-        // If not all files are ready, wait for downloads to complete
+        // If not all files are ready, wait for downloads to complete.
+        // Previously this returned silently and left the OLD player running the
+        // OLD media items forever (the "stuck shuffling old media" heisenbug),
+        // because nothing re-triggered a rebuild once the missing files arrived.
+        // Now we schedule a delayed retry that re-checks and rebuilds playback
+        // once all files are present (or gives up after several attempts).
+        // If not all files are ready, DON'T touch the old player. It keeps
+        // playing its current (old) content while the download completes in
+        // the background. When the download finishes, triggerPlaybackIfReady()
+        // will call us back with all files present for a SINGLE clean rebuild.
+        // Previously this returned via a retry loop that rebuilt playback every
+        // 1.5s, causing the hated stop/start/stop/start flutter.
         if (availableFiles.size < playlist.mediaFiles.size) {
-            Log.w(GeekDsConstants.TAG, "Not all files ready (${availableFiles.size}/${playlist.mediaFiles.size}) - waiting for downloads")
-            setState(AppState.SYNCING, "Waiting for file downloads...")
+            Log.w(
+                GeekDsConstants.TAG,
+                "Not all files ready (${availableFiles.size}/${playlist.mediaFiles.size}) - keeping old playback running, waiting for downloads"
+            )
+            return
+        }
+
+        val adsConfig = getPlayableAdsConfig()
+        if (adsConfig != null) {
+            startPlaylistPlaybackWithAds(playlist, availableFiles, adsConfig)
             return
         }
 
@@ -374,6 +417,8 @@ internal fun MainActivity.startPlaylistPlayback(playlist: Playlist, forceRestart
             // Clear the container and hide standby
             rootContainer?.removeAllViews()
             standbyImageView = null
+            isAdsLayoutActive = false
+            releaseAdPlayback()
 
             // Release previous player if exists
             player?.let {
@@ -437,6 +482,12 @@ internal fun MainActivity.startPlaylistPlayback(playlist: Playlist, forceRestart
             player?.setMediaItems(mediaItems)
             player?.repeatMode = androidx.media3.common.Player.REPEAT_MODE_ALL
             player?.shuffleModeEnabled = false
+
+            // Record the content signature of what this player was built from.
+            // enforceScheduleWithMultiple compares this against the cached
+            // playlist on each 3s pass to detect content drift (playlist
+            // updated but player was never rebuilt).
+            currentPlayingMediaIds = availableFiles.map { it.id }.toSet()
 
             // Enhanced listener for debugging
             player?.addListener(object : androidx.media3.common.Player.Listener {

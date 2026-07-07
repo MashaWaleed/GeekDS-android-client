@@ -3,6 +3,7 @@ package com.example.geekds.data
 import android.content.Context
 import android.util.Log
 import com.example.geekds.GeekDsConstants
+import com.example.geekds.model.AdsConfig
 import com.example.geekds.model.Playlist
 import com.example.geekds.model.Schedule
 import com.google.gson.Gson
@@ -92,6 +93,29 @@ object LocalStorage {
 
     fun loadOrientation(context: Context): Int {
         return prefs(context).getInt("device_orientation", 0)
+    }
+
+    fun saveAdsVersion(context: Context, version: Long) {
+        prefs(context).edit().putLong("ads_version", version).apply()
+    }
+
+    fun loadAdsVersion(context: Context): Long {
+        return prefs(context).getLong("ads_version", 0L)
+    }
+
+    fun saveAdsConfig(context: Context, config: AdsConfig) {
+        prefs(context).edit().putString("ads_config", Gson().toJson(config)).apply()
+        Log.i(GeekDsConstants.TAG, "Saved ads config version=${config.version}")
+    }
+
+    fun loadAdsConfig(context: Context): AdsConfig? {
+        val json = prefs(context).getString("ads_config", null) ?: return null
+        return try {
+            Gson().fromJson(json, AdsConfig::class.java)
+        } catch (e: Exception) {
+            Log.e(GeekDsConstants.TAG, "Failed to load ads config", e)
+            null
+        }
     }
 
     private fun prefs(context: Context) =

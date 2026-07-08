@@ -6,6 +6,7 @@ import android.graphics.Matrix
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.text.TextUtils
+import android.util.TypedValue
 import android.util.Log
 import android.view.Gravity
 import android.view.TextureView
@@ -76,9 +77,22 @@ internal fun MainActivity.fetchAdsConfig() {
                 )
 
                 if (config.shouldDisplay()) {
-                    downloadAdsMediaIfNeeded(config, restartPlaybackOnComplete = true)
+                    if (isPlaylistActive) {
+                        // Live playlist: restart playback so the ads overlay is applied.
+                        downloadAdsMediaIfNeeded(config, restartPlaybackOnComplete = true)
+                    } else {
+                        // Idle: show the ads template immediately; the media will be
+                        // downloaded into the ad panel if missing.
+                        startAdsLayoutWithStandby(config)
+                    }
                 } else {
-                    restartCurrentPlaylistPlayback("ads disabled/excluded")
+                    if (isPlaylistActive) {
+                        // Playlist active: rebuild without ads.
+                        restartCurrentPlaylistPlayback("ads disabled/excluded")
+                    } else {
+                        // Idle: remove the ad overlay now (plain standby image).
+                        showStandby()
+                    }
                 }
             } catch (e: Exception) {
                 Log.e(GeekDsConstants.TAG, "Error parsing ads config", e)
@@ -126,6 +140,115 @@ internal fun MainActivity.downloadAdsMediaIfNeeded(
         if (success) {
             Log.i(GeekDsConstants.TAG, "Ads media downloaded: ${media.getStorageFilename()}")
             if (restartPlaybackOnComplete) restartCurrentPlaylistPlayback("ads media downloaded")
+        } else {
+            Log.w(GeekDsConstants.TAG, "Ads media download failed: ${media.getStorageFilename()}")
+        }
+    }
+}
+
+// Ads layout selector for idle rendering.
+// Unlike getPlayableAdsConfig(), we don't require the media to already exist
+// locally; the layout can appear immediately and the ad asset will be
+// downloaded in the background if needed.
+internal fun MainActivity.getAdsLayoutConfig(): AdsConfig? {
+    val config = currentAdsConfig ?: LocalStorage.loadAdsConfig(this)?.also { currentAdsConfig = it }
+    if (config == null) return null
+    if (!config.enabled) return null
+    if (config.excluded) return null
+    if (config.media == null) return null
+    return config
+}
+
+internal fun MainActivity.startAdsLayoutWithStandby(adsConfig: AdsConfig) {
+    Log.i(GeekDsConstants.TAG, ">>> Showing ADS layout in standby mode")
+
+    runOnUiThread {
+        rootContainer?.removeAllViews()
+        standbyImageView = createStandbyImageView()
+        isAdsLayoutActive = true
+
+        releaseMainPlayerOnly()
+        releaseAdPlayerOnly()
+
+        val container = rootContainer
+        val containerWidth = container?.width?.takeIf { it > 0 } ?: resources.displayMetrics.widthPixels
+        val containerHeight =
+            container?.height?.takeIf { it > 0 } ?: resources.displayMetrics.heightPixels
+
+        val layout = adsConfig.layout
+        val adRegion = layout.adPanel.scaledTo(containerWidth, containerHeight, layout.width, layout.height)
+        val mainRegion = layout.mainVideo.scaledTo(containerWidth, containerHeight, layout.width, layout.height)
+        val tickerRegion = layout.ticker.scaledTo(containerWidth, containerHeight, layout.width, layout.height)
+
+        val adFrame = FrameLayout(this).apply {
+            setBackgroundColor(Color.BLACK)
+            layoutParams = adRegion.toFrameLayoutParams()
+        }
+        val mainFrame = FrameLayout(this).apply {
+            setBackgroundColor(Color.BLACK)
+            layoutParams = mainRegion.toFrameLayoutParams()
+        }
+        val ticker = createTickerView(adsConfig.tickerText, tickerRegion)
+
+        // Main standby image occupies the main-video region.
+        mainFrame.addView(standbyImageView)
+
+        rootContainer?.addView(adFrame)
+        rootContainer?.addView(mainFrame)
+        rootContainer?.addView(ticker)
+
+        // Start (or download and then start) the ad media.
+        downloadAdsMediaIntoFrameIfNeeded(adsConfig, adFrame)
+    }
+}
+
+private fun MainActivity.createStandbyImageView(): ImageView {
+    return ImageView(this).apply {
+        layoutParams = FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.MATCH_PARENT,
+            FrameLayout.LayoutParams.MATCH_PARENT
+        )
+        scaleType = ImageView.ScaleType.CENTER_CROP
+        setBackgroundColor(Color.BLACK)
+
+        try {
+            val resId = when (deviceOrientation) {
+                90 -> R.drawable.standby_image_90
+                180 -> R.drawable.standby_image_180
+                270 -> R.drawable.standby_image_270
+                else -> R.drawable.standby_image_0
+            }
+            setImageResource(resId)
+        } catch (e: Exception) {
+            Log.e(GeekDsConstants.TAG, "Failed to load standby image for orientation $deviceOrientation", e)
+            setBackgroundColor(Color.parseColor("#1a1a1a"))
+        }
+    }
+}
+
+internal fun MainActivity.downloadAdsMediaIntoFrameIfNeeded(config: AdsConfig, adFrame: FrameLayout) {
+    val media = config.media ?: return
+    val file = File(getExternalFilesDir(null), media.getStorageFilename())
+
+    if (file.exists() && file.length() > 0L && file.canRead()) {
+        startAdMediaInFrame(adFrame, media)
+        return
+    }
+
+    // If we're already downloading, just wait for that to complete.
+    if (isDownloadingAdsMedia) {
+        Log.d(GeekDsConstants.TAG, "Ads media download already in progress")
+        return
+    }
+
+    isDownloadingAdsMedia = true
+    Log.i(GeekDsConstants.TAG, "Ads media missing; downloading ${media.getStorageFilename()}")
+
+    downloadMediaWithCallback(media.getStorageFilename(), media.filename) { success ->
+        isDownloadingAdsMedia = false
+        if (success) {
+            Log.i(GeekDsConstants.TAG, "Ads media downloaded: ${media.getStorageFilename()}")
+            runOnUiThread { startAdMediaInFrame(adFrame, media) }
         } else {
             Log.w(GeekDsConstants.TAG, "Ads media download failed: ${media.getStorageFilename()}")
         }
@@ -341,7 +464,8 @@ private fun MainActivity.createTickerView(text: String, region: AdsRegion): View
         orientation = LinearLayout.HORIZONTAL
         background = barBackground
         layoutParams = region.toFrameLayoutParams()
-        setPadding(20, 8, 20, 8)
+        val verticalPad = (region.height * 0.08f).toInt().coerceAtLeast(2)
+        setPadding(20, verticalPad, 20, verticalPad)
     }
 
     // Small rounded "chip" behind the clock to set it off from the ticker.
@@ -352,17 +476,19 @@ private fun MainActivity.createTickerView(text: String, region: AdsRegion): View
         setStroke(2, Color.argb(70, 255, 255, 255))
     }
 
-    // Small fixed-width clock segment on the left; the rest scrolls.
-    val clockWidth = (region.width * 0.2f).toInt()
+    // Small fixed-width clock segment on the right; ticker uses remaining width.
+    val clockWidth = (region.width * 0.13f).toInt()
+    val clockTextPx = (region.height * 0.52f).coerceAtLeast(20f)
+    val tickerTextPx = (region.height * 0.48f).coerceAtLeast(18f)
 
     val clock = TextView(this).apply {
         background = clockChipBg
         setTextColor(textMain)
-        textSize = 30f
+        setTextSize(TypedValue.COMPLEX_UNIT_PX, clockTextPx)
         setTypeface(Typeface.create("sans-serif-condensed", Typeface.NORMAL))
         gravity = Gravity.CENTER
         setSingleLine(true)
-        setPadding(24, 4, 24, 4)
+        setPadding(18, 4, 18, 4)
         letterSpacing = 0.08f
         this.text = formatClockTime()
     }
@@ -382,7 +508,7 @@ private fun MainActivity.createTickerView(text: String, region: AdsRegion): View
 
     val ticker = TextView(this).apply {
         setTextColor(textMain)
-        textSize = 30f
+        setTextSize(TypedValue.COMPLEX_UNIT_PX, tickerTextPx)
         setTypeface(Typeface.SANS_SERIF, Typeface.NORMAL)
         gravity = Gravity.CENTER_VERTICAL
         setPadding(0, 0, 32, 0)
@@ -397,9 +523,9 @@ private fun MainActivity.createTickerView(text: String, region: AdsRegion): View
     }
     tickerTextView = ticker
 
-    container.addView(clock, LinearLayout.LayoutParams(clockWidth, FrameLayout.LayoutParams.MATCH_PARENT))
-    container.addView(divider)
     container.addView(ticker)
+    container.addView(divider)
+    container.addView(clock, LinearLayout.LayoutParams(clockWidth, FrameLayout.LayoutParams.MATCH_PARENT))
 
     startTickerClock()
     return container
@@ -415,8 +541,16 @@ private fun MainActivity.startTickerClock() {
     }
 }
 
-private fun formatClockTime(): String {
-    return java.time.LocalTime.now().format(java.time.format.DateTimeFormatter.ofPattern("HH:mm"))
+private fun MainActivity.formatClockTime(): String {
+    // Use server-provided offset minutes as source of truth to avoid stale
+    // timezone/DST rules on Android TV boxes.
+    val timezoneOffsetMs = serverTimezoneOffsetMinutes.toLong() * 60_000L
+    val correctedNow = java.time.Instant.now()
+        .plusMillis(clockOffsetMs)
+        .plusMillis(timezoneOffsetMs)
+        .atZone(java.time.ZoneOffset.UTC)
+        .toLocalTime()
+    return correctedNow.format(java.time.format.DateTimeFormatter.ofPattern("HH:mm"))
 }
 
 private fun MainActivity.startMainPlayerInFrame(frame: FrameLayout, availableFiles: List<MediaFile>) {

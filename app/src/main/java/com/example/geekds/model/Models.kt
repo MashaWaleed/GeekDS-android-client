@@ -55,8 +55,8 @@ data class AdsConfig(
             width = 1920,
             height = 1080,
             adPanel = AdsRegion(x = 0, y = 0, width = 570, height = 1080),
-            mainVideo = AdsRegion(x = 570, y = 0, width = 1350, height = 965),
-            ticker = AdsRegion(x = 570, y = 965, width = 1350, height = 115),
+            mainVideo = AdsRegion(x = 570, y = 0, width = 1350, height = 1010),
+            ticker = AdsRegion(x = 570, y = 1010, width = 1350, height = 70),
         )
     }
 }

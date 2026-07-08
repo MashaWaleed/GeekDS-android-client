@@ -109,6 +109,10 @@ class MainActivity : Activity() {
     internal var tickerTextView: TextView? = null
     internal var clockTextView: TextView? = null
     internal var tickerClockJob: Job? = null
+    internal var timeSyncJob: Job? = null
+    internal var clockOffsetMs: Long = 0L
+    internal var serverTimezoneId: String = "Africa/Cairo"
+    internal var serverTimezoneOffsetMinutes: Int = 0
     internal var isAdsLayoutActive: Boolean = false
     internal var currentAdsConfig: AdsConfig? = null
     internal var lastKnownAdsVersion: Long = 0L
@@ -186,9 +190,19 @@ class MainActivity : Activity() {
 
         lastKnownAdsVersion = LocalStorage.loadAdsVersion(this)
         currentAdsConfig = LocalStorage.loadAdsConfig(this)
+        clockOffsetMs = LocalStorage.loadClockOffsetMs(this)
+        serverTimezoneId = LocalStorage.loadServerTimezone(this) ?: "Africa/Cairo"
+        serverTimezoneOffsetMinutes = LocalStorage.loadServerTimezoneOffsetMinutes(this)
         if (lastKnownAdsVersion > 0L) {
             Log.i(GeekDsConstants.TAG, "Restoring cached ads version: $lastKnownAdsVersion")
         }
+        if (clockOffsetMs != 0L) {
+            Log.i(GeekDsConstants.TAG, "Restoring cached clock offset: ${clockOffsetMs}ms")
+        }
+        Log.i(
+            GeekDsConstants.TAG,
+            "Using server timezone: $serverTimezoneId (offset=${serverTimezoneOffsetMinutes}m)"
+        )
 
         // Create a root container that can hold both standby image and player.
         // FrameLayout is the right fit here because playback/standby are full-screen
@@ -262,6 +276,7 @@ class MainActivity : Activity() {
         // Clean up coroutines
         scope.cancel()
         scheduleEnforcerJob?.cancel()
+        timeSyncJob?.cancel()
 
         // Clean up network monitoring and wake lock
         cleanupNetworkMonitoring()

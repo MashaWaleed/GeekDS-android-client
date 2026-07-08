@@ -23,7 +23,6 @@ internal fun MainActivity.stopCurrentPlayback() {
         // Clear the content signature so the drift check in
         // enforceScheduleWithMultiple starts fresh after a stop.
         currentPlayingMediaIds = emptySet()
-        releaseAdPlayback()
 
         // Show standby screen with image
         showStandby()

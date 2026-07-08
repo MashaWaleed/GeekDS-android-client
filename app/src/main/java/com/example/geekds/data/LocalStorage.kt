@@ -103,6 +103,30 @@ object LocalStorage {
         return prefs(context).getLong("ads_version", 0L)
     }
 
+    fun saveClockOffsetMs(context: Context, offsetMs: Long) {
+        prefs(context).edit().putLong("clock_offset_ms", offsetMs).apply()
+    }
+
+    fun loadClockOffsetMs(context: Context): Long {
+        return prefs(context).getLong("clock_offset_ms", 0L)
+    }
+
+    fun saveServerTimezone(context: Context, timezone: String) {
+        prefs(context).edit().putString("server_timezone", timezone).apply()
+    }
+
+    fun loadServerTimezone(context: Context): String? {
+        return prefs(context).getString("server_timezone", null)
+    }
+
+    fun saveServerTimezoneOffsetMinutes(context: Context, offsetMinutes: Int) {
+        prefs(context).edit().putInt("server_timezone_offset_minutes", offsetMinutes).apply()
+    }
+
+    fun loadServerTimezoneOffsetMinutes(context: Context): Int {
+        return prefs(context).getInt("server_timezone_offset_minutes", 0)
+    }
+
     fun saveAdsConfig(context: Context, config: AdsConfig) {
         prefs(context).edit().putString("ads_config", Gson().toJson(config)).apply()
         Log.i(GeekDsConstants.TAG, "Saved ads config version=${config.version}")

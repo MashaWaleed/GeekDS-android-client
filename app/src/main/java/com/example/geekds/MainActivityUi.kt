@@ -18,6 +18,20 @@ internal fun MainActivity.showStandby() {
         player = null
         playerView = null
 
+        // If ads are enabled and not excluded, keep the ads template visible
+        // even during idle/schedule gaps. The standby image will occupy the
+        // main video region, while the ticker + ad panel remain on screen.
+        val adsConfigForLayout = getAdsLayoutConfig()
+        if (adsConfigForLayout != null) {
+            startAdsLayoutWithStandby(adsConfigForLayout)
+            setState(AppState.IDLE, "Standby mode with ads")
+            return
+        }
+
+        // Ads are disabled/excluded; stop the ad overlay so it doesn't keep
+        // running while we're in plain standby.
+        releaseAdPlayback()
+
         runOnUiThread {
             // Clear the container
             rootContainer?.removeAllViews()

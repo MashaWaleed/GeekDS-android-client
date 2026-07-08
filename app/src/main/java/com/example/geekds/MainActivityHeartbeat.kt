@@ -14,6 +14,9 @@ import com.example.geekds.util.NetworkUtils
 internal fun MainActivity.startBackgroundTasks() {
         scope.coroutineContext.cancelChildren()
         scheduleEnforcerJob?.cancel()
+        // Refresh ads config on startup so server-side layout tweaks apply immediately.
+        fetchAdsConfig()
+        startClockSyncLoop()
         Log.i(GeekDsConstants.TAG, "Starting unified 20s heartbeat loop (pause-on-failure mode)")
 
         // Heartbeat loop every 20s when not paused
@@ -115,14 +118,14 @@ internal fun MainActivity.sendUnifiedHeartbeat() {
                     val txt = response.body?.string()
                     val json = JSONObject(txt ?: "{}")
 
-                    // ✨ CHECK FOR UPDATE REQUEST FIRST - highest priority
+                    // The in-app APK updater is intentionally removed.
+                    // OTA updates are handled by the device-level enrollment updater script.
                     val updateRequested = json.optBoolean("update_requested", false)
                     if (updateRequested) {
-                        Log.w(GeekDsConstants.TAG, "*** UPDATE REQUESTED BY SERVER ***")
-                        runOnUiThread {
-                            initiateAppUpdate()
-                        }
-                        return // Don't process rest of heartbeat - update takes priority
+                        Log.w(
+                            GeekDsConstants.TAG,
+                            "Server requested update; in-app updater disabled, waiting for enrollment updater script"
+                        )
                     }
 
                     // Check for orientation change. handleOrientationUpdate() no-ops

@@ -2,6 +2,7 @@ package com.example.geekds
 import android.content.Context
 import android.net.*
 import android.os.PowerManager
+import android.view.WindowManager
 import kotlinx.coroutines.*
 import okhttp3.*
 import java.io.IOException
@@ -10,16 +11,30 @@ import com.example.geekds.data.LocalStorage
 import com.example.geekds.model.*
 import com.example.geekds.util.NetworkUtils
 
+internal fun MainActivity.setupScreenStayOn() {
+        // keepScreenOn in the manifest is not always honored on Android TV boxes.
+        // Re-apply at the window + root view level so the display stays on in idle.
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        rootContainer?.keepScreenOn = true
+    }
+
 internal fun MainActivity.setupWakeLock() {
         try {
             val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
-            wakeLock = powerManager.newWakeLock(
-                PowerManager.PARTIAL_WAKE_LOCK,
-                "GeekDS::KeepAlive"
-            ).apply {
-                acquire(10*60*1000L /*10 minutes*/)
+            if (wakeLock == null) {
+                wakeLock = powerManager.newWakeLock(
+                    PowerManager.PARTIAL_WAKE_LOCK,
+                    "GeekDS::KeepAlive"
+                ).apply {
+                    setReferenceCounted(false)
+                }
             }
-            Log.i(GeekDsConstants.TAG, "Wake lock acquired")
+            if (wakeLock?.isHeld != true) {
+                // No timeout: PARTIAL_WAKE_LOCK keeps background work alive; screen
+                // stay-on is handled separately via FLAG_KEEP_SCREEN_ON.
+                wakeLock?.acquire()
+                Log.i(GeekDsConstants.TAG, "Wake lock acquired")
+            }
         } catch (e: Exception) {
             Log.e(GeekDsConstants.TAG, "Failed to acquire wake lock", e)
         }
@@ -177,7 +192,8 @@ internal fun MainActivity.attemptConnectionRecovery() {
 
         scope.launch {
             try {
-                // Re-acquire wake lock if needed
+                // Re-apply screen stay-on + wake lock if the box dropped them during idle
+                setupScreenStayOn()
                 if (wakeLock?.isHeld != true) {
                     setupWakeLock()
                 }

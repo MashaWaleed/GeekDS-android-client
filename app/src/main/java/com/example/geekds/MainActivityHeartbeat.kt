@@ -46,10 +46,11 @@ internal fun MainActivity.startBackgroundTasks() {
             }
         }
 
-        // Wake lock maintenance
+        // Wake lock + screen stay-on maintenance (TV boxes can drop both after idle)
         scope.launch {
             while (isActive) {
-                delay(5 * 60 * 1000L)
+                delay(60_000L)
+                setupScreenStayOn()
                 if (wakeLock?.isHeld != true) {
                     Log.w(GeekDsConstants.TAG, "Wake lock lost, re-acquiring")
                     setupWakeLock()

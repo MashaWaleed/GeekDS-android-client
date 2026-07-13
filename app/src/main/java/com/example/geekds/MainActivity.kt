@@ -213,6 +213,7 @@ class MainActivity : Activity() {
                 ViewGroup.LayoutParams.MATCH_PARENT
             )
             setBackgroundColor(Color.BLACK)
+            keepScreenOn = true
         }
 
         // Add status view to container (optional - you can remove this if you don't want it visible)
@@ -227,8 +228,9 @@ class MainActivity : Activity() {
 
         // Initialize with standby screen
         showStandby()
-        // Setup network monitoring and wake lock
+        // Setup network monitoring, screen stay-on, and CPU wake lock
         setupNetworkMonitoring()
+        setupScreenStayOn()
         setupWakeLock()
 
         deviceId = LocalStorage.loadDeviceId(this)
@@ -257,6 +259,13 @@ class MainActivity : Activity() {
             setState(AppState.REGISTERING, "Registering device...")
             showRegistrationScreen() // Use proper registration flow
         }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // Some TV firmware clears keep-screen-on flags after idle/screensaver.
+        setupScreenStayOn()
+        setupWakeLock()
     }
 
     override fun onDestroy() {

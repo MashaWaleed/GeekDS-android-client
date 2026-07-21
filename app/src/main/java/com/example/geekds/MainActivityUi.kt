@@ -17,6 +17,8 @@ internal fun MainActivity.showStandby() {
         }
         player = null
         playerView = null
+        clearMainVideoSurfaceRefs()
+        currentVideoSize = null
 
         // If ads are enabled and not excluded, keep the ads template visible
         // even during idle/schedule gaps. The standby image will occupy the

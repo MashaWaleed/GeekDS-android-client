@@ -10,6 +10,7 @@ import android.os.Handler
 import android.os.Looper
 import android.os.PowerManager
 import android.util.Log
+import android.view.SurfaceView
 import android.view.TextureView
 import androidx.media3.common.VideoSize
 import android.view.ViewGroup
@@ -96,19 +97,26 @@ class MainActivity : Activity() {
 
     internal var state: AppState = AppState.REGISTERING
     internal val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
+    // Isolated from scope.cancelChildren() in startBackgroundTasks().
+    // Main thread required: ExoPlayer and Choreographer must not be touched off-main.
+    internal val perfScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     internal var scheduleEnforcerJob: Job? = null
 
     internal var player: ExoPlayer? = null
     internal var playerView: PlayerView? = null
     internal var videoTextureView: TextureView? = null
+    /** Efficient hardware-overlay surface used when orientation is 0°. */
+    internal var videoSurfaceView: SurfaceView? = null
     internal var currentVideoSize: VideoSize? = null
 
     internal var adPlayer: ExoPlayer? = null
     internal var adTextureView: TextureView? = null
+    internal var adSurfaceView: SurfaceView? = null
     internal var adImageView: ImageView? = null
     internal var tickerTextView: TextView? = null
     internal var clockTextView: TextView? = null
     internal var tickerClockJob: Job? = null
+    internal var tickerScrollAnimator: android.animation.ObjectAnimator? = null
     internal var timeSyncJob: Job? = null
     internal var clockOffsetMs: Long = 0L
     internal var serverTimezoneId: String = "Africa/Cairo"
@@ -126,6 +134,12 @@ class MainActivity : Activity() {
     internal val recoveryCooldown = GeekDsConstants.RECOVERY_COOLDOWN_MS
 
     internal var currentRegistrationDialog: AlertDialog? = null
+
+    internal var perfMonitorJob: Job? = null
+    internal var perfFrameCount: Int = 0
+    internal var perfLastCpuTimeMs: Long = 0L
+    internal var perfLastWallTimeMs: Long = 0L
+    internal var perfFrameCallback: android.view.Choreographer.FrameCallback? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -228,6 +242,9 @@ class MainActivity : Activity() {
 
         // Initialize with standby screen
         showStandby()
+        if (BuildConfig.DEBUG) {
+            startPerfMonitor()
+        }
         // Setup network monitoring, screen stay-on, and CPU wake lock
         setupNetworkMonitoring()
         setupScreenStayOn()
@@ -286,6 +303,8 @@ class MainActivity : Activity() {
         scope.cancel()
         scheduleEnforcerJob?.cancel()
         timeSyncJob?.cancel()
+        stopPerfMonitor()
+        perfScope.cancel()
 
         // Clean up network monitoring and wake lock
         cleanupNetworkMonitoring()

@@ -47,7 +47,7 @@ internal fun MainActivity.applyOrientation(degrees: Int) {
 
     // 3. Live player rotation - only meaningful if something is actually playing.
     // If nothing is playing yet, startPlaylistPlayback() applies the cached
-    // deviceOrientation itself once the TextureView is created and attached.
+    // deviceOrientation itself once the video surface is created and attached.
     if (isPlaylistActive) {
         applyPlayerRotation(normalized)
     }
@@ -114,8 +114,33 @@ internal fun MainActivity.handleOrientationUpdate(newDegrees: Int) {
  * - For 90°/270°, we rotate the video pixels INSIDE that landscape view so a
  *   portrait 1080x1920 video becomes a 1920x1080 image in Android coordinates.
  *   After the user physically rotates the TV, that appears as full-screen portrait.
+ *
+ * At 0° we prefer SurfaceView (hardware overlay). TextureView is only used when
+ * pixel transforms are required (90/180/270).
  */
 internal fun MainActivity.applyPlayerRotation(degrees: Int) {
+    // Ads layout never applies pixel rotation — SurfaceView is always the right choice there.
+    if (isAdsLayoutActive) return
+
+    val wantsTexture = needsTextureVideoSurface(degrees)
+    val hasTexture = videoTextureView != null
+    val hasSurface = videoSurfaceView != null
+
+    // Wrong surface for the requested orientation — rebuild once with the efficient choice.
+    if (isPlaylistActive && wantsTexture != hasTexture) {
+        Log.i(
+            GeekDsConstants.TAG,
+            "Surface type mismatch for ${degrees}° (texture=$hasTexture surface=$hasSurface) — rebuilding playback"
+        )
+        restartCurrentPlaylistPlayback("orientation surface switch to ${degrees}°")
+        return
+    }
+
+    if (!wantsTexture) {
+        // SurfaceView path: ExoPlayer scaling mode handles center-crop; nothing to matrix.
+        return
+    }
+
     val tv = videoTextureView ?: return
     val container = rootContainer ?: return
 

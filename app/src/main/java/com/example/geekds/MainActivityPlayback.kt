@@ -3,8 +3,6 @@ import android.view.ViewGroup
 import android.widget.FrameLayout
 import androidx.media3.common.MediaItem
 import androidx.media3.exoplayer.ExoPlayer
-import androidx.media3.ui.PlayerView
-import android.view.TextureView
 import okhttp3.*
 import org.json.JSONObject
 import java.io.*
@@ -431,39 +429,16 @@ internal fun MainActivity.startPlaylistPlayback(playlist: Playlist, forceRestart
             Log.i(GeekDsConstants.TAG, "Creating new ExoPlayer")
             player = ExoPlayer.Builder(this@startPlaylistPlayback).build()
 
-            // Render directly into a TextureView attached to rootContainer, rather
-            // than through PlayerView's own surface.
-            //
-            // WHY: PlayerView defaults to rendering onto a SurfaceView. SurfaceView's
-            // pixel content is composited by hardware in a separate window behind the
-            // normal view hierarchy ("punch-through") - so View-level transforms like
-            // .rotation/.scaleX/.scaleY only affect the SurfaceView's embedding bounds,
-            // NOT the actual picture drawn on it. That's why rotation only ever changed
-            // the bounding box dimensions but never visually rotated the frame content.
-            //
-            // TextureView, in contrast, renders through the normal GPU/view pipeline,
-            // so View.rotation genuinely rotates its pixel content. We keep `playerView`
-            // around (unattached) only because MainActivityScreenshot.kt references
-            // playerView.videoSurfaceView as one of its fallback frame-capture methods;
-            // it's not used for primary rendering or layout anymore.
-            Log.i(GeekDsConstants.TAG, "Creating TextureView for video rendering")
-            videoTextureView = TextureView(this@startPlaylistPlayback).apply {
-                layoutParams = FrameLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT,
-                    ViewGroup.LayoutParams.MATCH_PARENT,
-                    android.view.Gravity.CENTER
-                )
-            }
+            // SurfaceView at 0° (hardware overlay, cooler on weak boxes).
+            // TextureView only when orientation needs pixel-level rotation.
+            val exo = player ?: return@runOnUiThread
+            attachVideoSurface(
+                container = rootContainer ?: return@runOnUiThread,
+                exo = exo,
+                layoutParams = matchParentCenterParams(),
+                orientation = deviceOrientation,
+            )
 
-            // Set the TextureView on the player itself - correct method for TextureView
-            player?.setVideoTextureView(videoTextureView)
-
-            Log.i(GeekDsConstants.TAG, "Adding TextureView to container")
-            rootContainer?.addView(videoTextureView)
-
-            // Re-apply cached orientation: a fresh TextureView is created every
-            // time playback (re)starts, so any rotation set on a previous one
-            // is gone and needs to be reapplied to THIS instance.
             if (deviceOrientation != 0) {
                 applyPlayerRotation(deviceOrientation)
             }
@@ -508,7 +483,9 @@ internal fun MainActivity.startPlaylistPlayback(playlist: Playlist, forceRestart
                         GeekDsConstants.TAG,
                         "Video size changed: ${videoSize.width}x${videoSize.height} pixelRatio=${videoSize.pixelWidthHeightRatio} unappliedRotation=${videoSize.unappliedRotationDegrees}"
                     )
-                    applyPlayerRotation(deviceOrientation)
+                    if (needsTextureVideoSurface(deviceOrientation)) {
+                        applyPlayerRotation(deviceOrientation)
+                    }
                 }
 
                 override fun onPlaybackStateChanged(playbackState: Int) {
@@ -524,23 +501,8 @@ internal fun MainActivity.startPlaylistPlayback(playlist: Playlist, forceRestart
                     if (playbackState == androidx.media3.common.Player.STATE_READY) {
                         setState(AppState.IDLE, "Playing playlist ${currentPlaylistId}")
                         Log.i(GeekDsConstants.TAG, "*** PLAYBACK READY - SHOULD BE PLAYING NOW ***")
-                        // Cheap safety net: re-assert rotation once playback is confirmed ready.
-                        if (deviceOrientation != 0) {
+                        if (needsTextureVideoSurface(deviceOrientation)) {
                             applyPlayerRotation(deviceOrientation)
-                        }
-                        // DIAGNOSTIC ONLY - no behavior change. Logs the actual live pixel
-                        // dimensions of the TextureView and its container right now, so we
-                        // can see ground truth instead of assuming. Safe to remove later.
-                        videoTextureView?.post {
-                            val tv = videoTextureView
-                            val container = rootContainer
-                            Log.i(
-                                GeekDsConstants.TAG,
-                                "DIAG: deviceOrientation=$deviceOrientation tv.rotation=${tv?.rotation} " +
-                                        "tv.width=${tv?.width} tv.height=${tv?.height} " +
-                                        "container.width=${container?.width} container.height=${container?.height} " +
-                                        "screen=${resources.displayMetrics.widthPixels}x${resources.displayMetrics.heightPixels}"
-                            )
                         }
                     } else if (playbackState == androidx.media3.common.Player.STATE_ENDED) {
                         Log.i(GeekDsConstants.TAG, "*** PLAYBACK ENDED - SHOWING STANDBY ***")

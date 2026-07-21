@@ -5,11 +5,9 @@ import android.graphics.Color
 import android.graphics.Matrix
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
-import android.text.TextUtils
 import android.util.TypedValue
 import android.util.Log
 import android.view.Gravity
-import android.view.TextureView
 import android.view.View
 import android.widget.FrameLayout
 import android.widget.ImageView
@@ -35,6 +33,7 @@ import okhttp3.Response
 import org.json.JSONObject
 import java.io.File
 import java.io.IOException
+import android.view.TextureView
 
 internal fun MainActivity.fetchAdsConfig() {
     val id = deviceId ?: return
@@ -301,7 +300,7 @@ internal fun MainActivity.releaseAdPlayback() {
     tickerClockJob?.cancel()
     tickerClockJob = null
     releaseAdPlayerOnly()
-    adTextureView = null
+    clearAdVideoSurfaceRefs()
     adImageView = null
     tickerTextView = null
     clockTextView = null
@@ -442,6 +441,18 @@ private fun AdsRegion.toFrameLayoutParams(): FrameLayout.LayoutParams {
     }
 }
 
+// Returns a text size (in px) whose full line height (ascent+descent, i.e. what
+// a single line of glyphs actually needs including descenders like g/y/p) fits
+// inside targetHeightPx. A flat "% of box height" guess ignores that a font's
+// line height is normally 1.2-1.4x its nominal size, which is what was causing
+// the ticker/clock text to overflow and get clipped at the bottom of the bar.
+private fun fittingTextSizePx(targetHeightPx: Float, minPx: Float = 20f): Float {
+    val probe = android.graphics.Paint().apply { textSize = 100f }
+    val fm = probe.fontMetrics
+    val lineHeightPerUnit = (fm.descent - fm.ascent) / 100f
+    return (targetHeightPx / lineHeightPerUnit).coerceAtLeast(minPx)
+}
+
 private fun MainActivity.createTickerView(text: String, region: AdsRegion): View {
     // Refined palette: a deep slate gradient for the bar, bright accent for the
     // clock chip, and high-contrast white text. Looks cleaner than the flat
@@ -460,11 +471,12 @@ private fun MainActivity.createTickerView(text: String, region: AdsRegion): View
         cornerRadius = 0f // bar spans full width; keep flush with edges
     }
 
+    val verticalPad = (region.height * 0.08f).toInt().coerceAtLeast(2)
+
     val container = LinearLayout(this).apply {
         orientation = LinearLayout.HORIZONTAL
         background = barBackground
         layoutParams = region.toFrameLayoutParams()
-        val verticalPad = (region.height * 0.08f).toInt().coerceAtLeast(2)
         setPadding(20, verticalPad, 20, verticalPad)
     }
 
@@ -478,8 +490,14 @@ private fun MainActivity.createTickerView(text: String, region: AdsRegion): View
 
     // Small fixed-width clock segment on the right; ticker uses remaining width.
     val clockWidth = (region.width * 0.13f).toInt()
-    val clockTextPx = (region.height * 0.52f).coerceAtLeast(20f)
-    val tickerTextPx = (region.height * 0.48f).coerceAtLeast(18f)
+
+    // Text size is derived from real font metrics (ascent+descent), not a flat
+    // percentage of the bar height. A raw "% of height" guess ignores that a
+    // font's actual line height is ~20-30% taller than its nominal size, so it
+    // was overflowing the bar and getting clipped at the bottom edge.
+    val availableTextHeight = (region.height - verticalPad * 2).toFloat().coerceAtLeast(1f)
+    val clockTextPx  = fittingTextSizePx(availableTextHeight * 0.88f, 22f)
+    val tickerTextPx = fittingTextSizePx(availableTextHeight * 0.82f, 20f)
 
     val clock = TextView(this).apply {
         background = clockChipBg
@@ -488,6 +506,7 @@ private fun MainActivity.createTickerView(text: String, region: AdsRegion): View
         setTypeface(Typeface.create("sans-serif-condensed", Typeface.NORMAL))
         gravity = Gravity.CENTER
         setSingleLine(true)
+        includeFontPadding = false
         setPadding(18, 4, 18, 4)
         letterSpacing = 0.08f
         this.text = formatClockTime()
@@ -506,29 +525,85 @@ private fun MainActivity.createTickerView(text: String, region: AdsRegion): View
         }
     }
 
+    // The ticker clips its (wider-than-the-bar) text child. A plain wrap_content
+    // TextView inside a fixed-size, clipping FrameLayout lets the text be as
+    // long as it needs to be while only the clip container occupies layout space.
+    val tickerClip = FrameLayout(this).apply {
+        clipChildren = true
+        clipToPadding = true
+        layoutParams = LinearLayout.LayoutParams(0, FrameLayout.LayoutParams.MATCH_PARENT, 1f)
+    }
+
     val ticker = TextView(this).apply {
         setTextColor(textMain)
         setTextSize(TypedValue.COMPLEX_UNIT_PX, tickerTextPx)
         setTypeface(Typeface.SANS_SERIF, Typeface.NORMAL)
         gravity = Gravity.CENTER_VERTICAL
-        setPadding(0, 0, 32, 0)
         setSingleLine(true)
+        includeFontPadding = false
         setShadowLayer(4f, 0f, 1f, Color.argb(120, 0, 0, 0))
-        ellipsize = TextUtils.TruncateAt.MARQUEE
-        marqueeRepeatLimit = -1 // loop forever
-        isSelected = true // required to keep marquee animating
         letterSpacing = 0.02f
         this.text = text
-        layoutParams = LinearLayout.LayoutParams(0, FrameLayout.LayoutParams.MATCH_PARENT, 1f)
+        layoutParams = FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.WRAP_CONTENT,
+            FrameLayout.LayoutParams.MATCH_PARENT
+        )
+        // Cache this view's rendered content as a GPU texture. Once cached,
+        // moving it (translationX below) is a pure compositor transform and
+        // does NOT re-invoke onDraw()/Canvas.drawText() - unlike the old
+        // ellipsize=MARQUEE approach, which re-drew text on the CPU every
+        // single frame, forever, on top of whatever video decoding was
+        // already running.
+        setLayerType(View.LAYER_TYPE_HARDWARE, null)
     }
+    tickerClip.addView(ticker)
     tickerTextView = ticker
 
-    container.addView(ticker)
+    container.addView(tickerClip)
     container.addView(divider)
     container.addView(clock, LinearLayout.LayoutParams(clockWidth, FrameLayout.LayoutParams.MATCH_PARENT))
 
     startTickerClock()
+    startTickerScroll(tickerClip, ticker)
     return container
+}
+
+// Scrolls [ticker] leftward across [clip] using translationX instead of
+// Android's built-in ellipsize=MARQUEE. Because ticker was given a hardware
+// layer above, this animates a cached GPU texture's transform each frame -
+// no Canvas re-draw, no onDraw() calls, no per-frame text layout. Far cheaper
+// to sustain 24/7 alongside concurrent video decode.
+private fun MainActivity.startTickerScroll(clip: FrameLayout, ticker: TextView) {
+    tickerScrollAnimator?.cancel()
+
+    // Wait for one layout pass so clip.width and ticker.width (from its
+    // wrap_content text measurement) are known.
+    clip.post {
+        val clipWidth = clip.width
+        val textWidth = ticker.width
+        if (clipWidth <= 0 || textWidth <= 0) return@post
+
+        val density = resources.displayMetrics.density
+        val scrollSpeedPxPerSec = 90f * density // constant visual speed regardless of text length
+        val totalDistance = (clipWidth + textWidth).toFloat()
+        val durationMs = ((totalDistance / scrollSpeedPxPerSec) * 1000L).toLong().coerceAtLeast(1000L)
+
+        ticker.translationX = clipWidth.toFloat() // start just off the right edge
+
+        val animator = android.animation.ObjectAnimator.ofFloat(
+            ticker,
+            View.TRANSLATION_X,
+            clipWidth.toFloat(),
+            -textWidth.toFloat()
+        ).apply {
+            duration = durationMs
+            interpolator = android.view.animation.LinearInterpolator()
+            repeatCount = android.animation.ValueAnimator.INFINITE
+            repeatMode = android.animation.ValueAnimator.RESTART
+        }
+        tickerScrollAnimator = animator
+        animator.start()
+    }
 }
 
 private fun MainActivity.startTickerClock() {
@@ -541,30 +616,18 @@ private fun MainActivity.startTickerClock() {
     }
 }
 
-private fun MainActivity.formatClockTime(): String {
-    // Use server-provided offset minutes as source of truth to avoid stale
-    // timezone/DST rules on Android TV boxes.
-    val timezoneOffsetMs = serverTimezoneOffsetMinutes.toLong() * 60_000L
-    val correctedNow = java.time.Instant.now()
-        .plusMillis(clockOffsetMs)
-        .plusMillis(timezoneOffsetMs)
-        .atZone(java.time.ZoneOffset.UTC)
-        .toLocalTime()
-    return correctedNow.format(java.time.format.DateTimeFormatter.ofPattern("HH:mm"))
-}
-
 private fun MainActivity.startMainPlayerInFrame(frame: FrameLayout, availableFiles: List<MediaFile>) {
-    val mainTexture = TextureView(this).apply {
-        layoutParams = FrameLayout.LayoutParams(
-            FrameLayout.LayoutParams.MATCH_PARENT,
-            FrameLayout.LayoutParams.MATCH_PARENT
-        )
-    }
-    videoTextureView = mainTexture
-    frame.addView(mainTexture)
-
+    // Ads layout never applies pixel rotation transforms, so always prefer SurfaceView.
     player = ExoPlayer.Builder(this).build().also { mainPlayer ->
-        mainPlayer.setVideoTextureView(mainTexture)
+        attachVideoSurface(
+            container = frame,
+            exo = mainPlayer,
+            layoutParams = FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT
+            ),
+            orientation = 0,
+        )
         mainPlayer.setMediaItems(availableFiles.map { mediaFile ->
             val file = File(getExternalFilesDir(null), mediaFile.getStorageFilename())
             MediaItem.fromUri(android.net.Uri.fromFile(file))
@@ -576,13 +639,13 @@ private fun MainActivity.startMainPlayerInFrame(frame: FrameLayout, availableFil
         mainPlayer.addListener(object : Player.Listener {
             override fun onVideoSizeChanged(videoSize: VideoSize) {
                 currentVideoSize = videoSize
-                applyCenterCropTransform(mainTexture, videoSize)
+                applyCenterCropTransform(videoTextureView, videoSize)
             }
 
             override fun onPlaybackStateChanged(playbackState: Int) {
                 if (playbackState == Player.STATE_READY) {
                     setState(AppState.IDLE, "Playing playlist ${currentPlaylistId} with ads")
-                    applyCenterCropTransform(mainTexture, currentVideoSize)
+                    applyCenterCropTransform(videoTextureView, currentVideoSize)
                 }
             }
 
@@ -625,36 +688,30 @@ private fun MainActivity.startAdMediaInFrame(frame: FrameLayout, media: MediaFil
         return
     }
 
-    val texture = TextureView(this).apply {
-        layoutParams = FrameLayout.LayoutParams(
-            FrameLayout.LayoutParams.MATCH_PARENT,
-            FrameLayout.LayoutParams.MATCH_PARENT
+    adPlayer = ExoPlayer.Builder(this).build().also { exo ->
+        attachVideoSurface(
+            container = frame,
+            exo = exo,
+            layoutParams = FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT
+            ),
+            forAdsPlayer = true,
+            orientation = 0,
         )
-    }
-    adTextureView = texture
-    frame.addView(texture)
-
-    adPlayer = ExoPlayer.Builder(this).build().also { player ->
-        player.setVideoTextureView(texture)
-        player.setMediaItem(MediaItem.fromUri(android.net.Uri.fromFile(file)))
-        player.repeatMode = Player.REPEAT_MODE_ONE
-        player.addListener(object : Player.Listener {
+        exo.setMediaItem(MediaItem.fromUri(android.net.Uri.fromFile(file)))
+        exo.repeatMode = Player.REPEAT_MODE_ONE
+        exo.addListener(object : Player.Listener {
             override fun onVideoSizeChanged(videoSize: VideoSize) {
-                applyCenterCropTransform(texture, videoSize)
-            }
-
-            override fun onPlaybackStateChanged(playbackState: Int) {
-                if (playbackState == Player.STATE_READY) {
-                    applyCenterCropTransform(texture, null)
-                }
+                applyCenterCropTransform(adTextureView, videoSize)
             }
 
             override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
                 Log.e(GeekDsConstants.TAG, "Ads player error", error)
             }
         })
-        player.prepare()
-        player.play()
+        exo.prepare()
+        exo.play()
     }
 }
 
@@ -665,7 +722,7 @@ private fun MainActivity.releaseMainPlayerOnly() {
     }
     player = null
     playerView = null
-    videoTextureView = null
+    clearMainVideoSurfaceRefs()
     currentVideoSize = null
 }
 
@@ -675,7 +732,9 @@ private fun MainActivity.releaseAdPlayerOnly() {
         it.release()
     }
     adPlayer = null
-    adTextureView = null
+    clearAdVideoSurfaceRefs()
     adImageView = null
+    tickerScrollAnimator?.cancel()
+    tickerScrollAnimator = null
     tickerTextView = null
 }

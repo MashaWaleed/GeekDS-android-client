@@ -243,8 +243,7 @@ internal fun MainActivity.syncScheduleAndMedia() {
                         .filter { it.getInt("device_id") == id && it.getBoolean("is_enabled") }
 
                     if (mySchedules.isNotEmpty()) {
-                        // Get current time components in UTC
-                        val now = ZonedDateTime.now(ZoneId.of("UTC"))
+                        val now = getServerDisplayZonedNow()
                         val currentDay = now.dayOfWeek.name.lowercase()
                         val currentTime = now.format(DateTimeFormatter.ofPattern("HH:mm"))
 

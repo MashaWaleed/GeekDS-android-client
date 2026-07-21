@@ -18,7 +18,7 @@ internal fun MainActivity.stopCurrentPlayback() {
         }
         player = null
         playerView = null
-        videoTextureView = null
+        clearMainVideoSurfaceRefs()
         currentVideoSize = null
         // Clear the content signature so the drift check in
         // enforceScheduleWithMultiple starts fresh after a stop.
@@ -31,14 +31,12 @@ internal fun MainActivity.stopCurrentPlayback() {
     }
 
 internal fun MainActivity.enforceScheduleWithMultiple(schedules: List<Schedule>) {
-        // Get current time in UTC
-        val now = ZonedDateTime.now(ZoneId.of("UTC"))
+        // Schedule slots are wall-clock times in the server display timezone.
+        // Use the same server offset + clock sync path as the ticker — NOT
+        // ZoneId.of(serverTimezoneId), which relies on the device's broken TZ DB.
+        val now = getServerDisplayZonedNow()
         val currentDay = now.dayOfWeek.name.lowercase()
         val currentTime = now.format(DateTimeFormatter.ofPattern("HH:mm"))
-
-        Log.d(GeekDsConstants.TAG, "=== MULTI-SCHEDULE CHECK ===")
-        Log.d(GeekDsConstants.TAG, "Current UTC: $currentDay $currentTime")
-        Log.d(GeekDsConstants.TAG, "Checking ${schedules.size} cached schedules")
 
         fun timeToMinutes(timeStr: String): Int {
             val parts = timeStr.split(":")
@@ -48,39 +46,17 @@ internal fun MainActivity.enforceScheduleWithMultiple(schedules: List<Schedule>)
 
         val currentMinutes = timeToMinutes(currentTime)
 
-        // DEBUG: Log all schedules
-        schedules.forEachIndexed { index, sched ->
-            Log.d(GeekDsConstants.TAG, "Schedule[$index]: '${sched.name}' playlist=${sched.playlistId}")
-
-            // Load and display playlist content
-            val playlistContent = LocalStorage.loadPlaylistById(this@enforceScheduleWithMultiple, sched.playlistId)
-            if (playlistContent != null && playlistContent.mediaFiles.isNotEmpty()) {
-                Log.d(GeekDsConstants.TAG, "  Playlist content: ${playlistContent.mediaFiles.map { it.filename }.joinToString(", ")}")
-            } else {
-                Log.d(GeekDsConstants.TAG, "  Playlist content: (not cached or empty)")
-            }
-
-            Log.d(GeekDsConstants.TAG, "  Days: ${sched.daysOfWeek.joinToString(",")}")
-            Log.d(GeekDsConstants.TAG, "  Time: ${sched.timeSlotStart}-${sched.timeSlotEnd}")
-            Log.d(GeekDsConstants.TAG, "  Valid: ${sched.validFrom} to ${sched.validUntil}")
-            Log.d(GeekDsConstants.TAG, "  Enabled: ${sched.isEnabled}")
-        }
-
-        // Find the active schedule for RIGHT NOW
+        // Find the active schedule for RIGHT NOW (no per-tick dump logging —
+        // that was a major CPU/I/O cost on weak TV boxes with logcat attached).
         val activeSchedule = schedules.find { schedule ->
-            Log.d(GeekDsConstants.TAG, "Checking schedule '${schedule.name}':")
-
             if (!schedule.isEnabled) {
-                Log.d(GeekDsConstants.TAG, "  ❌ Disabled")
                 return@find false
             }
 
             // Check day of week
             if (!schedule.daysOfWeek.contains(currentDay)) {
-                Log.d(GeekDsConstants.TAG, "  ❌ Wrong day (need ${schedule.daysOfWeek.joinToString(",")}, today is $currentDay)")
                 return@find false
             }
-            Log.d(GeekDsConstants.TAG, "  ✅ Day matches")
 
             // Check validity period
             fun parseValidityDate(dateStr: String?): LocalDate? {
@@ -100,38 +76,30 @@ internal fun MainActivity.enforceScheduleWithMultiple(schedules: List<Schedule>)
             val validUntil = parseValidityDate(schedule.validUntil)
 
             if (validFrom != null && now.toLocalDate().isBefore(validFrom)) {
-                Log.d(GeekDsConstants.TAG, "  ❌ Before valid period (starts $validFrom)")
                 return@find false
             }
             if (validUntil != null && now.toLocalDate().isAfter(validUntil)) {
-                Log.d(GeekDsConstants.TAG, "  ❌ After valid period (ended $validUntil)")
                 return@find false
             }
-            Log.d(GeekDsConstants.TAG, "  ✅ Valid period OK")
 
             // Check time slot
             val startMinutes = timeToMinutes(schedule.timeSlotStart)
             val endMinutes = timeToMinutes(schedule.timeSlotEnd)
 
-            val inTimeSlot = currentMinutes in startMinutes..endMinutes
-            Log.d(GeekDsConstants.TAG, "  Time check: current=$currentMinutes, range=$startMinutes-$endMinutes")
-            if (!inTimeSlot) {
-                Log.d(GeekDsConstants.TAG, "  ❌ Outside time window")
-                return@find false
-            }
-
-            Log.d(GeekDsConstants.TAG, "  ✅✅✅ ACTIVE SCHEDULE FOUND!")
-            true
+            currentMinutes in startMinutes..endMinutes
         }
 
         if (activeSchedule != null) {
-            Log.i(GeekDsConstants.TAG, "MULTI-SCHEDULE: Active='${activeSchedule.name}' playlist=${activeSchedule.playlistId}")
-            Log.i(GeekDsConstants.TAG, "Current state: isPlaylistActive=$isPlaylistActive, currentPlaylistId=$currentPlaylistId")
-
             // Check if we need to switch playlists
             val needsSwitch = !isPlaylistActive || currentPlaylistId != activeSchedule.playlistId
 
-            Log.i(GeekDsConstants.TAG, "needsSwitch=$needsSwitch (playing=${isPlaylistActive}, current=$currentPlaylistId vs target=${activeSchedule.playlistId})")
+            if (needsSwitch) {
+                Log.i(
+                    GeekDsConstants.TAG,
+                    "MULTI-SCHEDULE switch: '${activeSchedule.name}' playlist=${activeSchedule.playlistId} " +
+                        "(was playing=$isPlaylistActive id=$currentPlaylistId) @ $currentDay $currentTime"
+                )
+            }
 
             // Content-drift detection: even if the playlist ID hasn't changed
             // and we're "active", the PLAYLIST CONTENT may have changed (media
@@ -222,9 +190,8 @@ internal fun MainActivity.enforceScheduleWithMultiple(schedules: List<Schedule>)
                 }
             }
         } else {
-            Log.i(GeekDsConstants.TAG, "MULTI-SCHEDULE: No active schedule for current time window")
             if (isPlaylistActive) {
-                Log.i(GeekDsConstants.TAG, "*** STOPPING PLAYBACK *** - no active schedule")
+                Log.i(GeekDsConstants.TAG, "MULTI-SCHEDULE: No active schedule @ $currentDay $currentTime — stopping playback")
                 isPlaylistActive = false
                 currentPlaylistId = null
                 runOnUiThread { stopCurrentPlayback() }
@@ -259,7 +226,5 @@ internal fun MainActivity.enforceSchedule() {
             return
         }
 
-        // We have cached schedules - use multi-schedule enforcement
-        Log.d(GeekDsConstants.TAG, "Enforcing schedule with ${allSchedules.size} cached schedules")
         enforceScheduleWithMultiple(allSchedules)
     }

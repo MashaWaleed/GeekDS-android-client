@@ -4,6 +4,9 @@ import android.util.Log
 import com.example.geekds.data.LocalStorage
 import java.time.Instant
 import java.time.ZoneId
+import java.time.ZoneOffset
+import java.time.ZonedDateTime
+import java.time.format.DateTimeFormatter
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
@@ -11,7 +14,25 @@ import kotlinx.coroutines.launch
 import okhttp3.Request
 import org.json.JSONObject
 
-private const val CLOCK_SYNC_INTERVAL_MS = 30 * 1000L // debug interval
+private const val CLOCK_SYNC_INTERVAL_MS = 5 * 60 * 1000L
+
+/**
+ * Server-authoritative display wall clock (Africa/Cairo offset from /api/devices/time).
+ * Intentionally bypasses the device TZ database, which is often wrong on TV boxes.
+ */
+internal fun MainActivity.getServerDisplayZonedNow(): ZonedDateTime {
+    val timezoneOffsetMs = serverTimezoneOffsetMinutes.toLong() * 60_000L
+    return Instant.now()
+        .plusMillis(clockOffsetMs)
+        .plusMillis(timezoneOffsetMs)
+        .atZone(ZoneOffset.UTC)
+}
+
+internal fun MainActivity.formatClockTime(): String {
+    return getServerDisplayZonedNow()
+        .toLocalTime()
+        .format(DateTimeFormatter.ofPattern("HH:mm"))
+}
 
 internal fun MainActivity.startClockSyncLoop() {
     timeSyncJob?.cancel()
@@ -19,7 +40,6 @@ internal fun MainActivity.startClockSyncLoop() {
     timeSyncJob = scope.launch(Dispatchers.IO) {
         while (isActive) {
             try {
-                Log.d(GeekDsConstants.TAG, "Clock sync tick")
                 syncClockOffsetWithServer()
             } catch (e: Exception) {
                 Log.w(GeekDsConstants.TAG, "Clock sync failed: ${e.message}")
@@ -41,7 +61,6 @@ internal fun MainActivity.syncClockOffsetWithServer() {
         .build()
 
     val clientSendMs = System.currentTimeMillis()
-    Log.d(GeekDsConstants.TAG, "Clock sync request -> $cmsUrl/api/devices/time")
     client.newCall(request).execute().use { response ->
         if (!response.isSuccessful) {
             Log.w(GeekDsConstants.TAG, "Clock sync HTTP ${response.code}")
@@ -77,7 +96,6 @@ internal fun MainActivity.syncClockOffsetWithServer() {
         }
 
         val clientRecvMs = System.currentTimeMillis()
-        val rttMs = clientRecvMs - clientSendMs
         val estimatedClientMsAtServerSample = clientSendMs + ((clientRecvMs - clientSendMs) / 2L)
         val newOffsetMs = serverEpochMs - estimatedClientMsAtServerSample
 
@@ -86,11 +104,6 @@ internal fun MainActivity.syncClockOffsetWithServer() {
             clockOffsetMs = newOffsetMs
             LocalStorage.saveClockOffsetMs(this, newOffsetMs)
             Log.i(GeekDsConstants.TAG, "Clock offset updated to ${newOffsetMs}ms")
-        } else {
-            Log.d(
-                GeekDsConstants.TAG,
-                "Clock sync OK (offset stable at ${clockOffsetMs}ms, new=${newOffsetMs}ms, rtt=${rttMs}ms, tz=$serverTimezoneId, tzOffset=${serverTimezoneOffsetMinutes}m)"
-            )
         }
     }
 }

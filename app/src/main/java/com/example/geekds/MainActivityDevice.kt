@@ -79,7 +79,7 @@ internal fun MainActivity.stopAllActivities() {
                     player?.release()
                     player = null
                     playerView = null
-                    videoTextureView = null
+                    clearMainVideoSurfaceRefs()
                     currentVideoSize = null
                     releaseAdPlayback()
                     // Show standby screen

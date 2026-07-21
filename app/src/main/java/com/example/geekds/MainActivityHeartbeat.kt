@@ -42,7 +42,7 @@ internal fun MainActivity.startBackgroundTasks() {
             delay(5_000L)
             while (isActive) {
                 try { enforceSchedule() } catch (e: Exception) { Log.e(GeekDsConstants.TAG, "Error in schedule enforcement", e) }
-                delay(3_000L)
+                delay(GeekDsConstants.SCHEDULE_ENFORCE_INTERVAL_MS)
             }
         }
 
@@ -56,6 +56,11 @@ internal fun MainActivity.startBackgroundTasks() {
                     setupWakeLock()
                 }
             }
+        }
+
+        // Perf monitor: debug builds only (Choreographer FPS callback is continuous GPU/CPU work).
+        if (BuildConfig.DEBUG) {
+            startPerfMonitor()
         }
     }
 

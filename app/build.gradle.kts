@@ -13,45 +13,60 @@ android {
         targetSdk = 36
         versionCode = 1
         versionName = "1.2"
+    }
 
+//    signingConfigs {
+//        create("release") {
+//            storeFile = file("release.keystore")
+//            storePassword = "geekds"
+//            keyAlias = "geekds"
+//            keyPassword = "geekds"
+//        }
+//    }
+
+    signingConfigs {
+        create("release") {
+            storeFile = file(System.getProperty("user.home") + "/.android/debug.keystore")
+            storePassword = "android"
+            keyAlias = "androiddebugkey"
+            keyPassword = "android"
+        }
     }
 
     buildTypes {
         release {
             isMinifyEnabled = false
+            signingConfig = signingConfigs.getByName("release")
+
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
         }
     }
+
     buildFeatures {
         viewBinding = true
+        buildConfig = true
     }
 
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_11
         targetCompatibility = JavaVersion.VERSION_11
     }
+
     kotlinOptions {
         jvmTarget = "11"
     }
 }
 
 dependencies {
-
     implementation(libs.androidx.core.ktx)
     implementation("com.squareup.okhttp3:okhttp:4.9.3")
-    // Coroutines
-    // Media3 ExoPlayer core
+
     implementation("androidx.media3:media3-exoplayer:1.3.1")
-    // Media3 UI components
     implementation("androidx.media3:media3-ui:1.3.1")
-    // (Optional) Media3 session, if you need it
-    // implementation("androidx.media3:media3-session:1.3.1")
-    // Gson for JSON
+
     implementation("com.google.code.gson:gson:2.10.1")
-    // Coroutines
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
 }
-

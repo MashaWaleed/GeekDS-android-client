@@ -60,17 +60,19 @@ internal fun MainActivity.setupNetworkMonitoring() {
             networkCallback = object : ConnectivityManager.NetworkCallback() {
                 override fun onAvailable(network: Network) {
                     Log.i(GeekDsConstants.TAG, "*** NETWORK AVAILABLE ***")
+                    // Skip the initial onAvailable at boot — heartbeat already syncs, and
+                    // the legacy syncScheduleAndMedia() path hits /api/schedules (401).
+                    val wasDisconnected = !isNetworkAvailable
                     isNetworkAvailable = true
                     connectionFailureCount = 0
                     lastSuccessfulConnection = System.currentTimeMillis()
 
-                    // Restart background tasks when network comes back
-                    handler.postDelayed({
-                        if (deviceId != null) {
-                            Log.i(GeekDsConstants.TAG, "Network restored - restarting sync")
-                            syncScheduleAndMedia()
-                        }
-                    }, 2000) // Wait 2 seconds for network to stabilize
+                    if (wasDisconnected && deviceId != null) {
+                        handler.postDelayed({
+                            Log.i(GeekDsConstants.TAG, "Network restored - sending heartbeat")
+                            sendUnifiedHeartbeat()
+                        }, 2000)
+                    }
                 }
 
                 override fun onLost(network: Network) {

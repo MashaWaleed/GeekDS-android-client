@@ -238,8 +238,14 @@ internal fun MainActivity.sendUnifiedHeartbeat() {
                         }
                     }
 
-                    // Detect implicit schedule clear (server returns version 0) even if schedule_changed false
-                    val implicitScheduleCleared = (lastKnownScheduleVersion == 0L && scheduleChanged.not() && currentPlaylistId == null)
+                    // Fetch one initial snapshot when no cache exists. Once the
+                    // server has explicitly confirmed an empty schedule list,
+                    // do not fetch/clear/rebuild standby again every heartbeat.
+                    val implicitScheduleCleared =
+                        !scheduleSnapshotKnown &&
+                            lastKnownScheduleVersion == 0L &&
+                            scheduleChanged.not() &&
+                            currentPlaylistId == null
 
                     // Handle schedule changes
                     if (scheduleChanged || implicitScheduleCleared) {

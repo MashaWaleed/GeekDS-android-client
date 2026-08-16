@@ -162,12 +162,21 @@ internal fun MainActivity.startAdsLayoutWithStandby(adsConfig: AdsConfig) {
     Log.i(GeekDsConstants.TAG, ">>> Showing ADS layout in standby mode")
 
     runOnUiThread {
-        rootContainer?.removeAllViews()
-        standbyImageView = createStandbyImageView()
-        isAdsLayoutActive = true
+        // A network response may have decided "standby" just before the
+        // schedule switched to active playback. Never let that stale UI task
+        // tear down the newly started playlist.
+        if (isPlaylistActive) {
+            Log.i(GeekDsConstants.TAG, "Skipping stale standby ads layout: playlist is active")
+            return@runOnUiThread
+        }
 
         releaseMainPlayerOnly()
-        releaseAdPlayerOnly()
+        safeReleaseAdPlayer()
+        rootContainer?.removeAllViews()
+
+        standbyImageView = createStandbyImageView()
+        isAdsLayoutActive = true
+        resetDualSurfaceHealth()
 
         val container = rootContainer
         val containerWidth = container?.width?.takeIf { it > 0 } ?: resources.displayMetrics.widthPixels
@@ -236,7 +245,12 @@ internal fun MainActivity.downloadAdsMediaIntoFrameIfNeeded(config: AdsConfig, a
 
     // If we're already downloading, just wait for that to complete.
     if (isDownloadingAdsMedia) {
-        Log.d(GeekDsConstants.TAG, "Ads media download already in progress")
+        Log.d(GeekDsConstants.TAG, "Ads media download already in progress; waiting for current frame")
+        handler.postDelayed({
+            if (adFrame.isAttachedToWindow) {
+                downloadAdsMediaIntoFrameIfNeeded(config, adFrame)
+            }
+        }, 500L)
         return
     }
 
@@ -247,7 +261,13 @@ internal fun MainActivity.downloadAdsMediaIntoFrameIfNeeded(config: AdsConfig, a
         isDownloadingAdsMedia = false
         if (success) {
             Log.i(GeekDsConstants.TAG, "Ads media downloaded: ${media.getStorageFilename()}")
-            runOnUiThread { startAdMediaInFrame(adFrame, media) }
+            runOnUiThread {
+                if (adFrame.isAttachedToWindow) {
+                    startAdMediaInFrame(adFrame, media)
+                } else {
+                    Log.i(GeekDsConstants.TAG, "Ignoring ads download callback for detached layout")
+                }
+            }
         } else {
             Log.w(GeekDsConstants.TAG, "Ads media download failed: ${media.getStorageFilename()}")
         }
@@ -257,17 +277,23 @@ internal fun MainActivity.downloadAdsMediaIntoFrameIfNeeded(config: AdsConfig, a
 internal fun MainActivity.startPlaylistPlaybackWithAds(
     playlist: Playlist,
     availableFiles: List<MediaFile>,
-    adsConfig: AdsConfig
+    adsConfig: AdsConfig,
+    startGen: Int = playbackStartGeneration,
 ) {
-    Log.i(GeekDsConstants.TAG, ">>> Starting playlist ${playlist.id} with ADS layout")
+    Log.i(GeekDsConstants.TAG, ">>> Starting playlist ${playlist.id} with ADS layout (gen=$startGen)")
 
     runOnUiThread {
+        if (startGen != playbackStartGeneration) {
+            Log.i(GeekDsConstants.TAG, "Skipping stale ads playback start gen=$startGen")
+            return@runOnUiThread
+        }
+        safeReleaseMainPlayer()
+        safeReleaseAdPlayer()
         rootContainer?.removeAllViews()
+
         standbyImageView = null
         isAdsLayoutActive = true
-
-        releaseMainPlayerOnly()
-        releaseAdPlayerOnly()
+        resetDualSurfaceHealth()
 
         val container = rootContainer
         val containerWidth = container?.width?.takeIf { it > 0 } ?: resources.displayMetrics.widthPixels
@@ -291,7 +317,7 @@ internal fun MainActivity.startPlaylistPlaybackWithAds(
         rootContainer?.addView(mainFrame)
         rootContainer?.addView(ticker)
 
-        startMainPlayerInFrame(mainFrame, availableFiles)
+        startMainPlayerInFrame(mainFrame, availableFiles, startGen)
         startAdMediaInFrame(adFrame, adsConfig.media)
     }
 }
@@ -299,7 +325,9 @@ internal fun MainActivity.startPlaylistPlaybackWithAds(
 internal fun MainActivity.releaseAdPlayback() {
     tickerClockJob?.cancel()
     tickerClockJob = null
-    releaseAdPlayerOnly()
+    tickerScrollAnimator?.cancel()
+    tickerScrollAnimator = null
+    safeReleaseAdPlayer()
     clearAdVideoSurfaceRefs()
     adImageView = null
     tickerTextView = null
@@ -608,18 +636,23 @@ private fun MainActivity.startTickerScroll(clip: FrameLayout, ticker: TextView) 
 
 private fun MainActivity.startTickerClock() {
     tickerClockJob?.cancel()
+    // Clock shows HH:mm — refreshing every second is pure waste on a kiosk.
     tickerClockJob = scope.launch(Dispatchers.Main) {
         while (isActive) {
             clockTextView?.text = formatClockTime()
-            delay(1000L)
+            delay(30_000L)
         }
     }
 }
 
-private fun MainActivity.startMainPlayerInFrame(frame: FrameLayout, availableFiles: List<MediaFile>) {
-    // Ads layout never applies pixel rotation transforms, so always prefer SurfaceView.
-    player = ExoPlayer.Builder(this).build().also { mainPlayer ->
-        attachVideoSurface(
+private fun MainActivity.startMainPlayerInFrame(
+    frame: FrameLayout,
+    availableFiles: List<MediaFile>,
+    startGen: Int,
+) {
+    mainSurfaceViewFrameReceived = false
+    player = buildEfficientExoPlayer(enableAudio = true, label = "main-ads").also { mainPlayer ->
+        val surface = attachVideoSurface(
             container = frame,
             exo = mainPlayer,
             layoutParams = FrameLayout.LayoutParams(
@@ -634,12 +667,16 @@ private fun MainActivity.startMainPlayerInFrame(frame: FrameLayout, availableFil
         })
         mainPlayer.repeatMode = Player.REPEAT_MODE_ALL
         mainPlayer.shuffleModeEnabled = false
-        // Record what this player was built from for content-drift detection.
         currentPlayingMediaIds = availableFiles.map { it.id }.toSet()
         mainPlayer.addListener(object : Player.Listener {
             override fun onVideoSizeChanged(videoSize: VideoSize) {
                 currentVideoSize = videoSize
                 applyCenterCropTransform(videoTextureView, videoSize)
+            }
+
+            override fun onRenderedFirstFrame() {
+                mainSurfaceViewFrameReceived = true
+                Log.i(GeekDsConstants.TAG, "Main ads-layout player rendered first frame")
             }
 
             override fun onPlaybackStateChanged(playbackState: Int) {
@@ -650,19 +687,50 @@ private fun MainActivity.startMainPlayerInFrame(frame: FrameLayout, availableFil
             }
 
             override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
+                if (releasingPlayers || startGen != playbackStartGeneration) {
+                    Log.w(GeekDsConstants.TAG, "Ignoring main player error during release/supersede: ${error.message}")
+                    return
+                }
                 Log.e(GeekDsConstants.TAG, "Main player error in ads layout", error)
                 setState(AppState.ERROR, "Playback error: ${error.message}")
                 isPlaylistActive = false
                 showStandby()
             }
         })
-        mainPlayer.prepare()
-        mainPlayer.play()
+        val start = {
+            if (startGen == playbackStartGeneration) {
+                mainPlayer.prepare()
+                mainPlayer.play()
+            }
+        }
+        if (surface is android.view.SurfaceView) {
+            surface.runWhenSurfaceReady(start)
+        } else {
+            start()
+        }
     }
 }
 
 private fun MainActivity.startAdMediaInFrame(frame: FrameLayout, media: MediaFile?) {
     if (media == null) return
+    if (!frame.isAttachedToWindow) {
+        // During cold boot setContentView() has run, but the window may not be
+        // attached yet. Cached/offline ads must wait for attachment instead of
+        // being dropped forever (there may be no network callback to retry).
+        Log.i(GeekDsConstants.TAG, "Ads frame not attached yet; deferring cached media start")
+        frame.addOnAttachStateChangeListener(object : View.OnAttachStateChangeListener {
+            override fun onViewAttachedToWindow(view: View) {
+                frame.removeOnAttachStateChangeListener(this)
+                if (frame.parent != null) {
+                    Log.i(GeekDsConstants.TAG, "Ads frame attached; starting cached media")
+                    startAdMediaInFrame(frame, media)
+                }
+            }
+
+            override fun onViewDetachedFromWindow(view: View) = Unit
+        })
+        return
+    }
 
     val file = File(getExternalFilesDir(null), media.getStorageFilename())
     if (!file.exists() || file.length() <= 0L || !file.canRead()) {
@@ -688,8 +756,36 @@ private fun MainActivity.startAdMediaInFrame(frame: FrameLayout, media: MediaFil
         return
     }
 
-    adPlayer = ExoPlayer.Builder(this).build().also { exo ->
-        attachVideoSurface(
+    // Prefer SurfaceView (same efficient path as main). If dual-SurfaceView fails on
+    // this SoC, the watchdog below rebuilds ads once as TextureView.
+    val useTexture = adSurfaceViewFallbackAttempted
+    adSurfaceViewFrameReceived = false
+    lateinit var adsExo: ExoPlayer
+    adsExo = buildEfficientExoPlayer(
+        enableAudio = false,
+        label = "ads",
+        onVideoDecoderInitialized = { decoderName ->
+            // HiSilicon's old OMX compositor can acknowledge/render frames to
+            // two SurfaceViews while showing one of them as black. ExoPlayer's
+            // onRenderedFirstFrame therefore cannot detect this failure. Once
+            // dual video is active, keep main on SurfaceView and move ads only.
+            if (!useTexture &&
+                videoSurfaceView != null &&
+                isUnsafeDualSurfaceDecoder(decoderName)
+            ) {
+                runOnUiThread {
+                    fallbackAdsToTexture(
+                        adFrame = frame,
+                        media = media,
+                        expectedPlayer = adsExo,
+                        reason = "incompatible dual-SurfaceView decoder $decoderName",
+                    )
+                }
+            }
+        },
+    ).also { exo ->
+        adPlayer = exo
+        val surface = attachVideoSurface(
             container = frame,
             exo = exo,
             layoutParams = FrameLayout.LayoutParams(
@@ -698,6 +794,7 @@ private fun MainActivity.startAdMediaInFrame(frame: FrameLayout, media: MediaFil
             ),
             forAdsPlayer = true,
             orientation = 0,
+            forceTexture = useTexture,
         )
         exo.setMediaItem(MediaItem.fromUri(android.net.Uri.fromFile(file)))
         exo.repeatMode = Player.REPEAT_MODE_ONE
@@ -706,35 +803,152 @@ private fun MainActivity.startAdMediaInFrame(frame: FrameLayout, media: MediaFil
                 applyCenterCropTransform(adTextureView, videoSize)
             }
 
+            override fun onRenderedFirstFrame() {
+                adSurfaceViewFrameReceived = true
+                Log.i(
+                    GeekDsConstants.TAG,
+                    "Ads player rendered first frame (${if (adTextureView != null) "TextureView" else "SurfaceView"})"
+                )
+            }
+
             override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
+                if (releasingPlayers) {
+                    Log.w(GeekDsConstants.TAG, "Ignoring ads player error during release: ${error.message}")
+                    return
+                }
                 Log.e(GeekDsConstants.TAG, "Ads player error", error)
             }
         })
-        exo.prepare()
-        exo.play()
+        val start: () -> Unit = {
+            if (adPlayer === exo && frame.isAttachedToWindow) {
+                exo.prepare()
+                exo.play()
+            } else {
+                Log.i(GeekDsConstants.TAG, "Skipping stale ads SurfaceView start")
+            }
+        }
+        if (surface is android.view.SurfaceView) {
+            surface.runWhenSurfaceReady(start)
+        } else {
+            start()
+        }
+    }
+
+    scheduleDualSurfaceWatchdog(frame, media)
+}
+
+private fun isUnsafeDualSurfaceDecoder(decoderName: String): Boolean {
+    return decoderName.contains("hisi", ignoreCase = true)
+}
+
+private fun MainActivity.fallbackAdsToTexture(
+    adFrame: FrameLayout,
+    media: MediaFile,
+    expectedPlayer: ExoPlayer? = null,
+    reason: String,
+) {
+    if (adSurfaceViewFallbackAttempted) return
+    if (!adFrame.isAttachedToWindow || videoSurfaceView == null) return
+    if (expectedPlayer != null && adPlayer !== expectedPlayer) return
+
+    Log.w(GeekDsConstants.TAG, "Ads SurfaceView fallback: $reason — ads → TextureView")
+    adSurfaceViewFallbackAttempted = true
+    safeReleaseAdPlayer()
+    adFrame.removeAllViews()
+    startAdMediaInFrame(adFrame, media)
+}
+
+private fun MainActivity.resetDualSurfaceHealth() {
+    mainSurfaceViewFrameReceived = false
+    adSurfaceViewFrameReceived = false
+    adSurfaceViewFallbackAttempted = false
+    dualSurfaceWatchdogPosted = false
+}
+
+/**
+ * If either SurfaceView never paints a frame within a few seconds, rebuild ads
+ * as TextureView so the main pane can keep the hardware overlay path.
+ */
+private fun MainActivity.scheduleDualSurfaceWatchdog(adFrame: FrameLayout, media: MediaFile) {
+    if (adSurfaceViewFallbackAttempted || dualSurfaceWatchdogPosted) return
+    if (adSurfaceView == null && videoSurfaceView == null) return
+    dualSurfaceWatchdogPosted = true
+    val gen = playbackStartGeneration
+    handler.postDelayed({
+        dualSurfaceWatchdogPosted = false
+        if (gen != playbackStartGeneration) return@postDelayed
+        if (adSurfaceViewFallbackAttempted) return@postDelayed
+        if (!adFrame.isAttachedToWindow) return@postDelayed
+
+        val mainOk = mainSurfaceViewFrameReceived || videoSurfaceView == null
+        val adsOk = adSurfaceViewFrameReceived || adSurfaceView == null || adTextureView != null
+        if (mainOk && adsOk) return@postDelayed
+
+        fallbackAdsToTexture(
+            adFrame = adFrame,
+            media = media,
+            reason = "first-frame timeout (mainFrame=$mainSurfaceViewFrameReceived adsFrame=$adSurfaceViewFrameReceived)",
+        )
+    }, 3500L)
+}
+
+internal fun MainActivity.safeReleaseMainPlayer() {
+    releasingPlayers = true
+    try {
+        player?.let {
+            try {
+                it.clearVideoSurface()
+            } catch (_: Exception) {
+            }
+            try {
+                it.stop()
+            } catch (_: Exception) {
+            }
+            try {
+                it.release()
+            } catch (e: Exception) {
+                Log.w(GeekDsConstants.TAG, "Main player release: ${e.message}")
+            }
+        }
+    } finally {
+        player = null
+        playerView = null
+        clearMainVideoSurfaceRefs()
+        currentVideoSize = null
+        releasingPlayers = false
+    }
+}
+
+internal fun MainActivity.safeReleaseAdPlayer() {
+    releasingPlayers = true
+    try {
+        adPlayer?.let {
+            try {
+                it.clearVideoSurface()
+            } catch (_: Exception) {
+            }
+            try {
+                it.stop()
+            } catch (_: Exception) {
+            }
+            try {
+                it.release()
+            } catch (e: Exception) {
+                Log.w(GeekDsConstants.TAG, "Ads player release: ${e.message}")
+            }
+        }
+    } finally {
+        adPlayer = null
+        clearAdVideoSurfaceRefs()
+        adImageView = null
+        releasingPlayers = false
     }
 }
 
 private fun MainActivity.releaseMainPlayerOnly() {
-    player?.let {
-        it.stop()
-        it.release()
-    }
-    player = null
-    playerView = null
-    clearMainVideoSurfaceRefs()
-    currentVideoSize = null
+    safeReleaseMainPlayer()
 }
 
 private fun MainActivity.releaseAdPlayerOnly() {
-    adPlayer?.let {
-        it.stop()
-        it.release()
-    }
-    adPlayer = null
-    clearAdVideoSurfaceRefs()
-    adImageView = null
-    tickerScrollAnimator?.cancel()
-    tickerScrollAnimator = null
-    tickerTextView = null
+    safeReleaseAdPlayer()
 }

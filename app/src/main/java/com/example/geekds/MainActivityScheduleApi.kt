@@ -74,6 +74,7 @@ internal fun MainActivity.fetchDeviceSchedule() {
                     if (schedules.isNotEmpty()) {
                         // Cache schedules FIRST
                         LocalStorage.saveAllSchedules(this@fetchDeviceSchedule, schedules)
+                        scheduleSnapshotKnown = true
                         Log.i(GeekDsConstants.TAG, "✅ Cached ${schedules.size} schedules for offline switching")
 
                         // Pre-download all playlists for offline use BEFORE updating version
@@ -87,17 +88,28 @@ internal fun MainActivity.fetchDeviceSchedule() {
                         lastAllSchedulesVersion = serverVersion
                         Log.i(GeekDsConstants.TAG, "✅ Updated all_schedules version to $serverVersion")
 
-                        // DO NOT call enforceScheduleWithMultiple() here!
-                        // The main enforcement loop (every 3s) will pick up changes from cache.
-                        // Calling it here causes race condition: background thread updates currentPlaylistId
-                        // before main loop can detect the switch.
-                        Log.i(GeekDsConstants.TAG, "🔄 Schedule cache updated - main loop will enforce on next cycle")
+                        // Enforce on the UI thread immediately so cold start does not wait
+                        // for the next schedule-loop tick (was up to 15s).
+                        runOnUiThread {
+                            Log.i(GeekDsConstants.TAG, "🔄 Schedule cache updated - enforcing now")
+                            enforceSchedule()
+                        }
                     } else {
-                        // NO SCHEDULES - completely clear cache
-                        Log.i(GeekDsConstants.TAG, "⚠️ No schedules assigned to this device - clearing all cache")
+                        // Explicitly cache the empty snapshot. Without this
+                        // marker every heartbeat mistakes "none assigned" for
+                        // "not fetched yet" and rebuilds standby continuously.
+                        val wasPlaylistActive = isPlaylistActive
+                        Log.i(GeekDsConstants.TAG, "⚠️ No schedules assigned to this device")
                         clearAllScheduleData()
-                        lastAllSchedulesVersion = serverVersion  // Update version even for empty state
-                        runOnUiThread { stopCurrentPlayback() }
+                        LocalStorage.saveAllSchedules(this@fetchDeviceSchedule, emptyList())
+                        scheduleSnapshotKnown = true
+                        lastAllSchedulesVersion = serverVersion
+
+                        if (wasPlaylistActive) {
+                            runOnUiThread { stopCurrentPlayback() }
+                        } else {
+                            Log.i(GeekDsConstants.TAG, "Already in standby; keeping ads player running")
+                        }
                     }
 
                 } catch (e: Exception) {
@@ -167,17 +179,18 @@ internal fun MainActivity.fetchAndCachePlaylist(playlistId: Int) {
                     Log.i(GeekDsConstants.TAG, "📋 Cached playlist $playlistId with ${mediaFiles.size} files: ${mediaFiles.map { "${it.id}-${it.filename}" }}")
 
                     if (forceRefresh) {
-                        Log.i(GeekDsConstants.TAG, "Playlist $playlistId revision changed during pre-cache - refreshing media files")
+                        Log.i(
+                            GeekDsConstants.TAG,
+                            "Playlist $playlistId revision changed during pre-cache — will fetch missing files only (never delete live files)"
+                        )
                     }
 
-                    var completedDownloads = 0
-                    var successfulDownloads = 0
+                    // IMPORTANT: never delete existing playable files here. Doing so races
+                    // the live ExoPlayer (heartbeat reload starts playback, then pre-cache
+                    // deletes+redownloads underneath → black main video until rename finishes).
                     val filesNeedingDownload = mediaFiles.filter { mediaFile ->
                         val file = File(getExternalFilesDir(null), mediaFile.getStorageFilename())
-                        if (forceRefresh && file.exists()) {
-                            file.delete()
-                        }
-                        forceRefresh || !file.exists() || file.length() == 0L
+                        !file.exists() || file.length() == 0L
                     }
 
                     if (filesNeedingDownload.isEmpty()) {
@@ -187,6 +200,8 @@ internal fun MainActivity.fetchAndCachePlaylist(playlistId: Int) {
                         return
                     }
 
+                    var completedDownloads = 0
+                    var successfulDownloads = 0
                     filesNeedingDownload.forEach { mediaFile ->
                         downloadMediaWithCallback(mediaFile.getStorageFilename(), mediaFile.filename) { success ->
                             completedDownloads++
@@ -398,6 +413,7 @@ internal fun MainActivity.clearAllScheduleData() {
         lastAllSchedulesVersion = 0L
         lastKnownScheduleVersion = 0L
         lastKnownPlaylistVersion = 0L
+        scheduleSnapshotKnown = false
 
         Log.i(GeekDsConstants.TAG, "Cleared all schedule/playlist cache and reset version tracking")
     }

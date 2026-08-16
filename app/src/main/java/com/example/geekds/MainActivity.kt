@@ -81,6 +81,8 @@ class MainActivity : Activity() {
 
     // Track last fetched ALL schedules version to avoid redundant fetches
     internal var lastAllSchedulesVersion: Long = 0
+    /** True once the server has returned either a non-empty or explicitly empty schedule snapshot. */
+    internal var scheduleSnapshotKnown: Boolean = false
 
     // Track in-progress downloads to prevent concurrent downloads of same file
     internal val activeDownloads = Collections.synchronizedSet(mutableSetOf<String>())
@@ -118,14 +120,25 @@ class MainActivity : Activity() {
     internal var tickerClockJob: Job? = null
     internal var tickerScrollAnimator: android.animation.ObjectAnimator? = null
     internal var timeSyncJob: Job? = null
+    /** Correction vs device system clock: display = System.currentTimeMillis() + clockOffsetMs. */
     internal var clockOffsetMs: Long = 0L
     internal var serverTimezoneId: String = "Africa/Cairo"
     internal var serverTimezoneOffsetMinutes: Int = 0
     internal var isAdsLayoutActive: Boolean = false
+    /** True while we intentionally stop/release players — ignore release-timeout "errors". */
+    internal var releasingPlayers: Boolean = false
+    /** Bumped on every playback start request; stale UI posts must no-op. */
+    internal var playbackStartGeneration: Int = 0
     internal var currentAdsConfig: AdsConfig? = null
     internal var lastKnownAdsVersion: Long = 0L
     internal var isFetchingAdsConfig: Boolean = false
     internal var isDownloadingAdsMedia: Boolean = false
+
+    /** Dual-SurfaceView health — if either pane never paints, fall ads back to TextureView. */
+    internal var mainSurfaceViewFrameReceived: Boolean = false
+    internal var adSurfaceViewFrameReceived: Boolean = false
+    internal var adSurfaceViewFallbackAttempted: Boolean = false
+    internal var dualSurfaceWatchdogPosted: Boolean = false
 
     internal var lastScheduleTimestamp: String? = null
     internal var lastPlaylistTimestamp: String? = null
@@ -204,6 +217,7 @@ class MainActivity : Activity() {
 
         lastKnownAdsVersion = LocalStorage.loadAdsVersion(this)
         currentAdsConfig = LocalStorage.loadAdsConfig(this)
+        scheduleSnapshotKnown = LocalStorage.loadAllSchedules(this) != null
         clockOffsetMs = LocalStorage.loadClockOffsetMs(this)
         serverTimezoneId = LocalStorage.loadServerTimezone(this) ?: "Africa/Cairo"
         serverTimezoneOffsetMinutes = LocalStorage.loadServerTimezoneOffsetMinutes(this)
@@ -211,7 +225,7 @@ class MainActivity : Activity() {
             Log.i(GeekDsConstants.TAG, "Restoring cached ads version: $lastKnownAdsVersion")
         }
         if (clockOffsetMs != 0L) {
-            Log.i(GeekDsConstants.TAG, "Restoring cached clock offset: ${clockOffsetMs}ms")
+            Log.i(GeekDsConstants.TAG, "Restoring cached clock correction: ${clockOffsetMs}ms")
         }
         Log.i(
             GeekDsConstants.TAG,
@@ -286,17 +300,15 @@ class MainActivity : Activity() {
     }
 
     override fun onDestroy() {
-        super.onDestroy()
-
         // Stop registration polling
         stopRegistrationPolling()
 
         // Dismiss any dialogs
         currentRegistrationDialog?.dismiss()
 
-        // Clean up player
-        player?.release()
-        player = null
+        // Clean up both decoders and their video surfaces.
+        safeReleaseMainPlayer()
+        releaseAdPlayback()
         standbyImageView = null
 
         // Clean up coroutines
@@ -309,6 +321,8 @@ class MainActivity : Activity() {
         // Clean up network monitoring and wake lock
         cleanupNetworkMonitoring()
         cleanupWakeLock()
+
+        super.onDestroy()
     }
 
     internal fun setState(newState: AppState, message: String) {

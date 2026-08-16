@@ -17,13 +17,20 @@ import org.json.JSONObject
 private const val CLOCK_SYNC_INTERVAL_MS = 5 * 60 * 1000L
 
 /**
- * Server-authoritative display wall clock (Africa/Cairo offset from /api/devices/time).
- * Intentionally bypasses the device TZ database, which is often wrong on TV boxes.
+ * Display wall clock = device system time + persisted correction vs server.
+ *
+ * On each successful /api/devices/time sync we store:
+ *   clockOffsetMs = server_epoch - device_wall_at_sample
+ * Then offline/online display is simply:
+ *   System.currentTimeMillis() + clockOffsetMs
+ * plus the server timezone offset for wall-clock HH:mm / schedule matching.
+ *
+ * This keeps advancing while the device is offline (as long as the RTC runs),
+ * and does not freeze to a last-seen server epoch.
  */
 internal fun MainActivity.getServerDisplayZonedNow(): ZonedDateTime {
     val timezoneOffsetMs = serverTimezoneOffsetMinutes.toLong() * 60_000L
-    return Instant.now()
-        .plusMillis(clockOffsetMs)
+    return Instant.ofEpochMilli(System.currentTimeMillis() + clockOffsetMs)
         .plusMillis(timezoneOffsetMs)
         .atZone(ZoneOffset.UTC)
 }
@@ -99,11 +106,16 @@ internal fun MainActivity.syncClockOffsetWithServer() {
         val estimatedClientMsAtServerSample = clientSendMs + ((clientRecvMs - clientSendMs) / 2L)
         val newOffsetMs = serverEpochMs - estimatedClientMsAtServerSample
 
-        // Keep updates stable and avoid tiny jitter churn.
+        // Persist correction relative to THIS device's system clock.
         if (kotlin.math.abs(newOffsetMs - clockOffsetMs) >= 500L) {
             clockOffsetMs = newOffsetMs
             LocalStorage.saveClockOffsetMs(this, newOffsetMs)
-            Log.i(GeekDsConstants.TAG, "Clock offset updated to ${newOffsetMs}ms")
+            Log.i(GeekDsConstants.TAG, "Clock correction updated to ${newOffsetMs}ms (device + correction)")
+        } else {
+            Log.d(
+                GeekDsConstants.TAG,
+                "Clock sync OK (correction=${clockOffsetMs}ms, rtt=${clientRecvMs - clientSendMs}ms)"
+            )
         }
     }
 }

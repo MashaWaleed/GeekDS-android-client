@@ -1,8 +1,8 @@
 package com.example.geekds
 import android.view.ViewGroup
 import android.widget.FrameLayout
+import android.os.Looper
 import androidx.media3.common.MediaItem
-import androidx.media3.exoplayer.ExoPlayer
 import okhttp3.*
 import org.json.JSONObject
 import java.io.*
@@ -119,7 +119,7 @@ internal fun MainActivity.fetchPlaylist(
             if (needsMediaRefresh || !isPlaylistActive || currentPlaylistId != playlistId || player == null) {
                 downloadPlaylistMedia(
                     playlist,
-                    forceRedownload = needsMediaRefresh,
+                    forceRedownload = contentChanged || forceRedownload,
                     onRefreshComplete = {
                         if (playlistTimestamp.isNotEmpty()) {
                             LocalStorage.saveCachedPlaylistUpdatedAt(this@fetchPlaylist, playlistId, playlistTimestamp)
@@ -219,15 +219,41 @@ internal fun MainActivity.downloadPlaylistMedia(
 }
 
 internal fun MainActivity.triggerPlaybackIfReady(playlist: Playlist, forceRestart: Boolean = false) {
-    // Only start playback if we should be playing right now
-    if (isPlaylistActive && currentPlaylistId == playlist.id) {
-        Log.i(GeekDsConstants.TAG, "Downloads complete - ${if (forceRestart) "restarting" else "starting"} playback")
+    // Download completion and OkHttp callbacks run on background threads.
+    // Media3 enforces that every player read/write (including playbackState)
+    // happens on the player's application thread, which is the main thread.
+    if (Looper.myLooper() != Looper.getMainLooper()) {
         runOnUiThread {
-            startPlaylistPlayback(playlist, forceRestart = forceRestart)
+            triggerPlaybackIfReady(playlist, forceRestart)
         }
-    } else {
-        Log.i(GeekDsConstants.TAG, "Downloads complete but playback not currently needed")
+        return
     }
+
+    // Only start playback if we should be playing right now
+    if (!(isPlaylistActive && currentPlaylistId == playlist.id)) {
+        Log.i(GeekDsConstants.TAG, "Downloads complete but playback not currently needed")
+        return
+    }
+
+    val targetIds = playlist.mediaFiles.map { it.id }.toSet()
+    val alreadyPlayingSame =
+        player != null &&
+            !releasingPlayers &&
+            currentPlayingMediaIds == targetIds &&
+            player?.playbackState != androidx.media3.common.Player.STATE_IDLE
+
+    // Heartbeat often fires forceRedownload twice; tearing down a healthy player
+    // causes Hisilicon release timeouts and black main video.
+    if (alreadyPlayingSame) {
+        Log.i(
+            GeekDsConstants.TAG,
+            "Downloads complete — already playing playlist ${playlist.id}, skip redundant restart"
+        )
+        return
+    }
+
+    Log.i(GeekDsConstants.TAG, "Downloads complete - ${if (forceRestart) "restarting" else "starting"} playback")
+    startPlaylistPlayback(playlist, forceRestart = forceRestart)
 }
 
 internal fun MainActivity.downloadMediaWithCallback(storageFilename: String, originalFilename: String, callback: (Boolean) -> Unit) {
@@ -359,7 +385,8 @@ internal fun MainActivity.downloadMediaWithCallback(storageFilename: String, ori
 }
 
 internal fun MainActivity.startPlaylistPlayback(playlist: Playlist, forceRestart: Boolean = false) {
-    Log.i(GeekDsConstants.TAG, ">>> startPlaylistPlayback called with ${playlist.mediaFiles.size} items (forceRestart=$forceRestart)")
+    val startGen = ++playbackStartGeneration
+    Log.i(GeekDsConstants.TAG, ">>> startPlaylistPlayback called with ${playlist.mediaFiles.size} items (forceRestart=$forceRestart gen=$startGen)")
 
     try {
         // Check if all files exist locally and are complete
@@ -385,18 +412,7 @@ internal fun MainActivity.startPlaylistPlayback(playlist: Playlist, forceRestart
             return
         }
 
-        // If not all files are ready, wait for downloads to complete.
-        // Previously this returned silently and left the OLD player running the
-        // OLD media items forever (the "stuck shuffling old media" heisenbug),
-        // because nothing re-triggered a rebuild once the missing files arrived.
-        // Now we schedule a delayed retry that re-checks and rebuilds playback
-        // once all files are present (or gives up after several attempts).
-        // If not all files are ready, DON'T touch the old player. It keeps
-        // playing its current (old) content while the download completes in
-        // the background. When the download finishes, triggerPlaybackIfReady()
-        // will call us back with all files present for a SINGLE clean rebuild.
-        // Previously this returned via a retry loop that rebuilt playback every
-        // 1.5s, causing the hated stop/start/stop/start flutter.
+        // If not all files are ready, DON'T touch the old player.
         if (availableFiles.size < playlist.mediaFiles.size) {
             Log.w(
                 GeekDsConstants.TAG,
@@ -407,32 +423,33 @@ internal fun MainActivity.startPlaylistPlayback(playlist: Playlist, forceRestart
 
         val adsConfig = getPlayableAdsConfig()
         if (adsConfig != null) {
-            startPlaylistPlaybackWithAds(playlist, availableFiles, adsConfig)
+            startPlaylistPlaybackWithAds(playlist, availableFiles, adsConfig, startGen)
             return
         }
 
         runOnUiThread {
-            // Clear the container and hide standby
+            if (startGen != playbackStartGeneration) {
+                Log.i(GeekDsConstants.TAG, "Skipping stale playback start gen=$startGen")
+                return@runOnUiThread
+            }
+            // Detach/release decoders before destroying their SurfaceViews.
+            // Old Hisilicon firmware can wedge a decoder when the view's
+            // Surface is destroyed while the player is still bound to it.
+            releaseAdPlayback()
+            safeReleaseMainPlayer()
             rootContainer?.removeAllViews()
+
             standbyImageView = null
             isAdsLayoutActive = false
-            releaseAdPlayback()
 
-            // Release previous player if exists
-            player?.let {
-                Log.i(GeekDsConstants.TAG, "Releasing previous player")
-                it.stop()
-                it.release()
-            }
-
-            // Create new player
+            // Create new player (hardware-preferring, lean buffers for local files)
             Log.i(GeekDsConstants.TAG, "Creating new ExoPlayer")
-            player = ExoPlayer.Builder(this@startPlaylistPlayback).build()
+            player = buildEfficientExoPlayer(enableAudio = true, label = "main")
 
             // SurfaceView at 0° (hardware overlay, cooler on weak boxes).
             // TextureView only when orientation needs pixel-level rotation.
             val exo = player ?: return@runOnUiThread
-            attachVideoSurface(
+            val surface = attachVideoSurface(
                 container = rootContainer ?: return@runOnUiThread,
                 exo = exo,
                 layoutParams = matchParentCenterParams(),
@@ -459,14 +476,14 @@ internal fun MainActivity.startPlaylistPlayback(playlist: Playlist, forceRestart
             player?.shuffleModeEnabled = false
 
             // Record the content signature of what this player was built from.
-            // enforceScheduleWithMultiple compares this against the cached
-            // playlist on each 3s pass to detect content drift (playlist
-            // updated but player was never rebuilt).
             currentPlayingMediaIds = availableFiles.map { it.id }.toSet()
 
-            // Enhanced listener for debugging
             player?.addListener(object : androidx.media3.common.Player.Listener {
                 override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
+                    if (releasingPlayers || startGen != playbackStartGeneration) {
+                        Log.w(GeekDsConstants.TAG, "Ignoring player error during release/supersede: ${error.message}")
+                        return
+                    }
                     Log.e(GeekDsConstants.TAG, "*** EXOPLAYER ERROR - FALLING BACK TO STANDBY ***")
                     Log.e(GeekDsConstants.TAG, "Error type: ${error.errorCode}")
                     Log.e(GeekDsConstants.TAG, "Error message: ${error.message}")
@@ -474,7 +491,7 @@ internal fun MainActivity.startPlaylistPlayback(playlist: Playlist, forceRestart
                     error.printStackTrace()
                     setState(AppState.ERROR, "Playback error: ${error.message}")
                     isPlaylistActive = false
-                    showStandby() // Show standby on error
+                    showStandby()
                 }
 
                 override fun onVideoSizeChanged(videoSize: androidx.media3.common.VideoSize) {
@@ -526,19 +543,26 @@ internal fun MainActivity.startPlaylistPlayback(playlist: Playlist, forceRestart
                 }
             })
 
-            Log.i(GeekDsConstants.TAG, "Calling player.prepare()")
-            player?.prepare()
-
-            Log.i(GeekDsConstants.TAG, "Calling player.play()")
-            player?.play()
-
-            Log.i(GeekDsConstants.TAG, "*** PLAYBACK SETUP COMPLETE ***")
+            val start: () -> Unit = {
+                if (startGen == playbackStartGeneration) {
+                    Log.i(GeekDsConstants.TAG, "Calling player.prepare()")
+                    player?.prepare()
+                    Log.i(GeekDsConstants.TAG, "Calling player.play()")
+                    player?.play()
+                    Log.i(GeekDsConstants.TAG, "*** PLAYBACK SETUP COMPLETE ***")
+                }
+            }
+            if (surface is android.view.SurfaceView) {
+                surface.runWhenSurfaceReady(start)
+            } else {
+                start()
+            }
         }
 
     } catch (e: Exception) {
         Log.e(GeekDsConstants.TAG, "*** EXCEPTION in startPlaylistPlayback ***", e)
         setState(AppState.ERROR, "Failed to start playback: ${e.message}")
         isPlaylistActive = false
-        showStandby() // Show standby on exception
+        showStandby()
     }
 }

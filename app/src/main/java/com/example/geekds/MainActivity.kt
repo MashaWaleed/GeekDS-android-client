@@ -23,8 +23,11 @@ import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.PlayerView
 import com.example.geekds.config.AppConfig
 import com.example.geekds.data.LocalStorage
+import com.example.geekds.kiosk.KioskBootstrap
+import com.example.geekds.kiosk.KioskKeepAliveService
 import com.example.geekds.network.ApiClient
 import com.example.geekds.util.DeviceIdentity
+import android.content.Intent
 import kotlinx.coroutines.*
 import kotlinx.coroutines.Dispatchers
 import java.util.Collections
@@ -154,6 +157,14 @@ class MainActivity : Activity() {
     internal var perfLastWallTimeMs: Long = 0L
     internal var perfFrameCallback: android.view.Choreographer.FrameCallback? = null
 
+    /** Suppresses kiosk auto-relaunch while we intentionally tear down (rare). */
+    internal var allowExit: Boolean = false
+    private val relaunchRunnable = Runnable {
+        if (!allowExit && !isFinishing) {
+            KioskBootstrap.bringMainToFront(this)
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
@@ -264,6 +275,15 @@ class MainActivity : Activity() {
         setupScreenStayOn()
         setupWakeLock()
 
+        // Non-root kiosk: keep-alive service + optional Home / battery prompts
+        KioskBootstrap.startKeepAlive(this)
+        handler.postDelayed({
+            KioskBootstrap.ensureRuntimePermissions(this)
+            KioskBootstrap.ensureBatteryOptimizationExempt(this)
+            KioskBootstrap.ensureDefaultHome(this)
+            KioskBootstrap.tryStartLockTask(this)
+        }, 1500)
+
         deviceId = LocalStorage.loadDeviceId(this)
 
         // Load device name from saved preferences if available
@@ -297,9 +317,53 @@ class MainActivity : Activity() {
         // Some TV firmware clears keep-screen-on flags after idle/screensaver.
         setupScreenStayOn()
         setupWakeLock()
+        handler.removeCallbacks(relaunchRunnable)
+        KioskBootstrap.startKeepAlive(this)
+    }
+
+    override fun onUserLeaveHint() {
+        super.onUserLeaveHint()
+        scheduleKioskRelaunch("onUserLeaveHint")
+    }
+
+    override fun onPause() {
+        super.onPause()
+        if (!allowExit) {
+            scheduleKioskRelaunch("onPause")
+        }
+    }
+
+    @Deprecated("Deprecated in Java")
+    override fun onBackPressed() {
+        // Swallow Back — signage player should stay on screen without root.
+        Log.i(GeekDsConstants.TAG, "Back pressed — ignored in kiosk mode")
+        scheduleKioskRelaunch("onBackPressed")
+    }
+
+    override fun onNewIntent(intent: Intent?) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        setupScreenStayOn()
+    }
+
+    private fun scheduleKioskRelaunch(reason: String) {
+        if (allowExit) return
+        Log.i(GeekDsConstants.TAG, "Scheduling kiosk relaunch ($reason)")
+        handler.removeCallbacks(relaunchRunnable)
+        handler.postDelayed(relaunchRunnable, GeekDsConstants.KIOSK_RELAUNCH_DELAY_MS)
+        // Also poke the FGS in case the activity process is being killed.
+        try {
+            val svc = Intent(this, KioskKeepAliveService::class.java).apply {
+                action = KioskKeepAliveService.ACTION_ENSURE_FOREGROUND
+            }
+            startService(svc)
+        } catch (e: Exception) {
+            Log.w(GeekDsConstants.TAG, "Could not poke keep-alive service", e)
+        }
     }
 
     override fun onDestroy() {
+        handler.removeCallbacks(relaunchRunnable)
         // Stop registration polling
         stopRegistrationPolling()
 
@@ -321,6 +385,12 @@ class MainActivity : Activity() {
         // Clean up network monitoring and wake lock
         cleanupNetworkMonitoring()
         cleanupWakeLock()
+
+        // If the activity is dying unexpectedly, ask the watchdog to reopen us.
+        if (!allowExit) {
+            KioskBootstrap.startKeepAlive(applicationContext)
+            KioskBootstrap.bringMainToFront(applicationContext)
+        }
 
         super.onDestroy()
     }

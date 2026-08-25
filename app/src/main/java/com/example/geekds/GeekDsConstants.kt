@@ -10,7 +10,9 @@ object GeekDsConstants {
     const val SCHEDULE_ENFORCE_INTERVAL_MS = 15_000L
     const val PREFS_NAME = "geekds_prefs"
     const val DEFAULT_DEVICE_NAME = "ARC-A-GR-18"
-    const val DEFAULT_CMS_URL = "http://cms.geekds.xyz:5000"
+    const val DEFAULT_CMS_URL = "http://192.168.1.11:5000"
     const val FALLBACK_CMS_URL = "http://192.168.1.212:5000"
     const val RECOVERY_COOLDOWN_MS = 60_000L
+    /** Delay before bringing UI back when the user leaves / closes the app. */
+    const val KIOSK_RELAUNCH_DELAY_MS = 600L
 }

@@ -1,3 +1,7 @@
 <resources>
     <string name="app_name">GeekDS</string>
+    <string name="kiosk_channel_name">GeekDS player</string>
+    <string name="kiosk_channel_desc">Keeps the digital signage player running</string>
+    <string name="kiosk_notification_title">GeekDS is running</string>
+    <string name="kiosk_notification_text">Tap to open the player</string>
 </resources>

@@ -47,15 +47,10 @@ class MainActivity : Activity() {
     internal var currentPlaylistId: Int? = null
     internal var isDownloadingMedia = false // Prevent download loop
 
-    // Content-drift detection: the set of media-file IDs that the CURRENT
-    // ExoPlayer instance was built from. enforceScheduleWithMultiple compares
-    // this against the cached playlist's media IDs on each 3s pass; if they
-    // differ (e.g. a media file was added/removed from the playlist but the
-    // player was never rebuilt), it forces a rebuild even though the playlist
-    // ID hasn't changed. This is the safety net that catches the case where
-    // the heartbeat advanced the version but the reload didn't rebuild the
-    // player.
-    internal var currentPlayingMediaIds: Set<Int> = emptySet()
+    // Ordered id:contentVersion signature of the files loaded into ExoPlayer.
+    // This detects additions, removals, reorderings, and in-place media
+    // replacements even when the playlist and media database IDs stay equal.
+    internal var currentPlayingMediaSignatures: List<String> = emptyList()
     // Add these new properties for standby managementP
     internal var standbyImageView: ImageView? = null
     internal var rootContainer: ViewGroup? = null

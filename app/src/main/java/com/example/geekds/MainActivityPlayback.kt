@@ -49,7 +49,8 @@ internal fun MainActivity.fetchPlaylist(
                             id = media.getInt("id"),
                             filename = media.getString("filename"),
                             duration = media.optInt("duration", 0),
-                            type = media.optString("type", "video/mp4")
+                            type = media.optString("type", "video/mp4"),
+                            contentVersion = media.optLong("content_version", 0L)
                         )
                     )
                 }
@@ -63,7 +64,8 @@ internal fun MainActivity.fetchPlaylist(
                             id = media.optInt("id", 0),
                             filename = media.getString("filename"),
                             duration = media.optInt("duration", 0),
-                            type = media.optString("type", "video/mp4")
+                            type = media.optString("type", "video/mp4"),
+                            contentVersion = media.optLong("content_version", 0L)
                         )
                     )
                 }
@@ -81,7 +83,8 @@ internal fun MainActivity.fetchPlaylist(
             val contentChanged = savedPlaylist == null ||
                     savedPlaylist.mediaFiles.size != playlist.mediaFiles.size ||
                     savedPlaylist.mediaFiles.zip(playlist.mediaFiles).any { (old, new) ->
-                        old.id != new.id || old.filename != new.filename
+                        old.getContentSignature() != new.getContentSignature() ||
+                            old.filename != new.filename
                     }
 
             val cachedUpdatedAt = LocalStorage.getCachedPlaylistUpdatedAt(this@fetchPlaylist, playlistId)
@@ -174,15 +177,13 @@ internal fun MainActivity.downloadPlaylistMedia(
         }
     }, 120_000L)
 
-    // Only download files that are genuinely missing or empty. We NEVER
-    // delete existing valid files — the old player should keep playing
-    // whatever it has until the new content is fully downloaded and verified.
-    // Previously forceRedownload=true would delete EVERYTHING including
-    // unchanged files (like standby images), leaving nothing to play during
-    // the download window and causing the hated stop/start/stop/start loop.
+    // contentVersion is part of the storage filename, so replaced media gets a
+    // new target while the old player safely keeps its old file open. Legacy
+    // servers without contentVersion still need the explicit force fallback.
+    val hasVersionedMedia = playlist.mediaFiles.all { it.contentVersion > 0L }
     val filesToDownload = playlist.mediaFiles.filter { mediaFile ->
         val file = File(getExternalFilesDir(null), mediaFile.getStorageFilename())
-        !file.exists() || file.length() == 0L
+        !file.exists() || file.length() == 0L || (forceRedownload && !hasVersionedMedia)
     }
 
     if (filesToDownload.isEmpty()) {
@@ -197,7 +198,12 @@ internal fun MainActivity.downloadPlaylistMedia(
     Log.i(GeekDsConstants.TAG, "Need to download ${filesToDownload.size} files (forceRedownload=$forceRedownload)")
 
     filesToDownload.forEach { mediaFile ->
-        downloadMediaWithCallback(mediaFile.getStorageFilename(), mediaFile.filename) { success ->
+        downloadMediaWithCallback(
+            mediaFile.getStorageFilename(),
+            mediaFile.filename,
+            replaceExisting = forceRedownload && mediaFile.contentVersion <= 0L,
+            contentVersion = mediaFile.contentVersion,
+        ) { success ->
             downloadCount++
             if (success) {
                 successCount++
@@ -235,12 +241,15 @@ internal fun MainActivity.triggerPlaybackIfReady(playlist: Playlist, forceRestar
         return
     }
 
-    val targetIds = playlist.mediaFiles.map { it.id }.toSet()
+    val targetSignature = playlist.mediaFiles.map { it.getContentSignature() }
+    val needsLegacyForcedRestart =
+        forceRestart && playlist.mediaFiles.any { it.contentVersion <= 0L }
     val alreadyPlayingSame =
         player != null &&
             !releasingPlayers &&
-            currentPlayingMediaIds == targetIds &&
-            player?.playbackState != androidx.media3.common.Player.STATE_IDLE
+            currentPlayingMediaSignatures == targetSignature &&
+            player?.playbackState != androidx.media3.common.Player.STATE_IDLE &&
+            !needsLegacyForcedRestart
 
     // Heartbeat often fires forceRedownload twice; tearing down a healthy player
     // causes Hisilicon release timeouts and black main video.
@@ -256,9 +265,15 @@ internal fun MainActivity.triggerPlaybackIfReady(playlist: Playlist, forceRestar
     startPlaylistPlayback(playlist, forceRestart = forceRestart)
 }
 
-internal fun MainActivity.downloadMediaWithCallback(storageFilename: String, originalFilename: String, callback: (Boolean) -> Unit) {
+internal fun MainActivity.downloadMediaWithCallback(
+    storageFilename: String,
+    originalFilename: String,
+    replaceExisting: Boolean = false,
+    contentVersion: Long = 0L,
+    callback: (Boolean) -> Unit
+) {
     val file = File(getExternalFilesDir(null), storageFilename)
-    if (file.exists() && file.length() > 0) {
+    if (!replaceExisting && file.exists() && file.length() > 0) {
         Log.i(GeekDsConstants.TAG, "File already exists: $storageFilename (${file.length()} bytes)")
         callback(true) // Already exists and has content
         return
@@ -296,10 +311,11 @@ internal fun MainActivity.downloadMediaWithCallback(storageFilename: String, ori
 
     // URL encode the ORIGINAL filename to fetch from server
     val encodedFilename = java.net.URLEncoder.encode(originalFilename, "UTF-8").replace("+", "%20")
+    val versionQuery = if (contentVersion > 0L) "?v=$contentVersion" else ""
     Log.d(GeekDsConstants.TAG, "Encoded server filename: $encodedFilename")
 
     val req = Request.Builder()
-        .url("$cmsUrl/api/media/$encodedFilename")
+        .url("$cmsUrl/api/media/$encodedFilename$versionQuery")
         .get()
         .build()
     client.newCall(req).enqueue(object : Callback {
@@ -343,8 +359,31 @@ internal fun MainActivity.downloadMediaWithCallback(storageFilename: String, ori
 
                 // Verify the download completed successfully
                 if (tempFile.exists() && tempFile.length() > 0) {
-                    // Move temp file to final location
-                    val renameSuccess = tempFile.renameTo(file)
+                    // Atomically replace the cache entry. This is safe even if
+                    // ExoPlayer still has the old inode open and avoids a
+                    // delete-before-download black-screen window.
+                    val renameSuccess = try {
+                        java.nio.file.Files.move(
+                            tempFile.toPath(),
+                            file.toPath(),
+                            java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+                            java.nio.file.StandardCopyOption.ATOMIC_MOVE,
+                        )
+                        true
+                    } catch (atomicError: Exception) {
+                        Log.w(GeekDsConstants.TAG, "Atomic media replace unavailable; falling back", atomicError)
+                        try {
+                            java.nio.file.Files.move(
+                                tempFile.toPath(),
+                                file.toPath(),
+                                java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+                            )
+                            true
+                        } catch (moveError: Exception) {
+                            Log.e(GeekDsConstants.TAG, "Media replace failed", moveError)
+                            false
+                        }
+                    }
                     Log.d(GeekDsConstants.TAG, "Rename result for $storageFilename: $renameSuccess (temp=${tempFile.absolutePath}, final=${file.absolutePath})")
 
                     if (renameSuccess) {
@@ -476,7 +515,7 @@ internal fun MainActivity.startPlaylistPlayback(playlist: Playlist, forceRestart
             player?.shuffleModeEnabled = false
 
             // Record the content signature of what this player was built from.
-            currentPlayingMediaIds = availableFiles.map { it.id }.toSet()
+            currentPlayingMediaSignatures = availableFiles.map { it.getContentSignature() }
 
             player?.addListener(object : androidx.media3.common.Player.Listener {
                 override fun onPlayerError(error: androidx.media3.common.PlaybackException) {

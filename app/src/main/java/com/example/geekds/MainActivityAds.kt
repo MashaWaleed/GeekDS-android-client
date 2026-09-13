@@ -401,7 +401,8 @@ private fun MainActivity.parseAdsConfig(json: JSONObject): AdsConfig {
             id = mediaJson.optInt("id", 0),
             filename = mediaJson.optString("filename", ""),
             duration = mediaJson.optInt("duration", 0),
-            type = mediaJson.optString("type", "video/mp4")
+            type = mediaJson.optString("type", "video/mp4"),
+            contentVersion = mediaJson.optLong("content_version", 0L)
         ).takeIf { it.id > 0 && it.filename.isNotBlank() }
     } else {
         null
@@ -667,7 +668,8 @@ private fun MainActivity.startMainPlayerInFrame(
         })
         mainPlayer.repeatMode = Player.REPEAT_MODE_ALL
         mainPlayer.shuffleModeEnabled = false
-        currentPlayingMediaIds = availableFiles.map { it.id }.toSet()
+        currentPlayingMediaSignatures =
+            availableFiles.map { it.getContentSignature() }
         mainPlayer.addListener(object : Player.Listener {
             override fun onVideoSizeChanged(videoSize: VideoSize) {
                 currentVideoSize = videoSize

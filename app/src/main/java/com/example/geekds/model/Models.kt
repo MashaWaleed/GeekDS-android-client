@@ -21,8 +21,14 @@ data class MediaFile(
     val filename: String,
     val duration: Int,
     val type: String,
+    // Changes whenever the server-side bytes are replaced. Zero keeps
+    // compatibility with playlists cached by older app/backend versions.
+    val contentVersion: Long = 0L,
 ) {
-    fun getStorageFilename(): String = "${id}-${filename}"
+    fun getStorageFilename(): String =
+        if (contentVersion > 0L) "${id}-${contentVersion}-${filename}" else "${id}-${filename}"
+
+    fun getContentSignature(): String = "$id:$contentVersion"
 }
 
 data class AdsRegion(

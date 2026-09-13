@@ -22,7 +22,7 @@ internal fun MainActivity.stopCurrentPlayback() {
         currentVideoSize = null
         // Clear the content signature so the drift check in
         // enforceScheduleWithMultiple starts fresh after a stop.
-        currentPlayingMediaIds = emptySet()
+        currentPlayingMediaSignatures = emptyList()
 
         // Show standby screen with image
         showStandby()
@@ -112,8 +112,9 @@ internal fun MainActivity.enforceScheduleWithMultiple(schedules: List<Schedule>)
             if (!needsSwitch) {
                 val cachedCheck = LocalStorage.loadPlaylistById(this@enforceScheduleWithMultiple, activeSchedule.playlistId)
                 if (cachedCheck != null) {
-                    val cachedIds = cachedCheck.mediaFiles.map { it.id }.toSet()
-                    if (cachedIds != currentPlayingMediaIds) {
+                    val cachedSignatures =
+                        cachedCheck.mediaFiles.map { it.getContentSignature() }
+                    if (cachedSignatures != currentPlayingMediaSignatures) {
                         val allFilesPresent = cachedCheck.mediaFiles.all { mf ->
                             val f = File(getExternalFilesDir(null), mf.getStorageFilename())
                             f.exists() && f.length() > 0L && f.canRead()
@@ -121,7 +122,7 @@ internal fun MainActivity.enforceScheduleWithMultiple(schedules: List<Schedule>)
                         if (allFilesPresent) {
                             Log.w(
                                 GeekDsConstants.TAG,
-                                "⚠️ CONTENT DRIFT: all files present, rebuilding playback (player={${currentPlayingMediaIds.joinToString()}} -> cached={${cachedIds.joinToString()}})"
+                                "⚠️ CONTENT DRIFT: all files present, rebuilding playback (player={${currentPlayingMediaSignatures.joinToString()}} -> cached={${cachedSignatures.joinToString()}})"
                             )
                             LocalStorage.savePlaylist(this@enforceScheduleWithMultiple, cachedCheck)
                             runOnUiThread {

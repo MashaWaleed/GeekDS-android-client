@@ -147,7 +147,8 @@ internal fun MainActivity.fetchAndCachePlaylist(playlistId: Int) {
                                     id = media.getInt("id"),
                                     filename = media.getString("filename"),
                                     duration = media.optInt("duration", 0),
-                                    type = media.optString("type", "video/mp4")
+                                    type = media.optString("type", "video/mp4"),
+                                    contentVersion = media.optLong("content_version", 0L)
                                 )
                             )
                         }
@@ -162,7 +163,8 @@ internal fun MainActivity.fetchAndCachePlaylist(playlistId: Int) {
                                     id = media.optInt("id", 0), // Fallback to 0 if not present
                                     filename = media.getString("filename"),
                                     duration = media.optInt("duration", 0),
-                                    type = media.optString("type", "video/mp4")
+                                    type = media.optString("type", "video/mp4"),
+                                    contentVersion = media.optLong("content_version", 0L)
                                 )
                             )
                         }
